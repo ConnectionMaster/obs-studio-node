@@ -51,10 +51,15 @@
 #endif
 #define SIMPLE_ENCODER_X264_LOWCPU "x264_lowcpu"
 #define SIMPLE_ENCODER_QSV "qsv"
+#define SIMPLE_ENCODER_QSV_AV1 "qsv_av1"
 #define SIMPLE_ENCODER_NVENC "nvenc"
+#define SIMPLE_ENCODER_NVENC_AV1 "nvenc_av1"
 #define SIMPLE_ENCODER_NVENC_HEVC "nvenc_hevc"
 #define SIMPLE_ENCODER_AMD "amd"
 #define SIMPLE_ENCODER_AMD_HEVC "amd_hevc"
+#define SIMPLE_ENCODER_AMD_AV1 "amd_av1"
+#define SIMPLE_ENCODER_APPLE_H264 "apple_h264"
+#define SIMPLE_ENCODER_APPLE_HEVC "apple_hevc"
 
 #define ADVANCED_ENCODER_X264 "obs_x264"
 #define ADVANCED_ENCODER_QSV "obs_qsv11"
@@ -64,12 +69,18 @@
 
 #define ENCODER_NEW_NVENC "jim_nvenc"
 #define ENCODER_NEW_HEVC_NVENC "jim_hevc_nvenc"
+#define ENCODER_AV1_NVENC "jim_av1_nvenc"
+#define ENCODER_AV1_SVT_FFMPEG "ffmpeg_svt_av1"
+#define ENCODER_AV1_AOM_FFMPEG "ffmpeg_aom_av1"
 
 #define APPLE_SOFTWARE_VIDEO_ENCODER "com.apple.videotoolbox.videoencoder.h264"
 #define APPLE_HARDWARE_VIDEO_ENCODER "com.apple.videotoolbox.videoencoder.h264.gva"
 #define APPLE_HARDWARE_VIDEO_ENCODER_M1 "com.apple.videotoolbox.videoencoder.ave.avc"
 
 #define ARCHIVE_NAME "archive_aac"
+
+#define SIMPLE_AUDIO_ENCODER_AAC "ffmpeg_aac"
+#define SIMPLE_AUDIO_ENCODER_OPUS "ffmpeg_opus"
 
 #define MAX_AUDIO_MIXES 6
 
@@ -134,10 +145,9 @@ public:
 	static void OBS_service_splitFile(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
 	static void Query(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
 
-	static void OBS_service_createVirtualWebcam(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
-	static void OBS_service_removeVirtualWebcam(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
-	static void OBS_service_startVirtualWebcam(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
-	static void OBS_service_stopVirtualWebcan(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
+	static void OBS_service_startVirtualCam(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
+	static void OBS_service_stopVirtualCam(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
+	static void OBS_service_updateVirtualCam(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval);
 
 private:
 	static bool startStreaming(StreamServiceId serviceId);
@@ -160,6 +170,14 @@ private:
 	static void UpdateRecordingSettings_amd_cqp(int cqp);
 	static void updateVideoRecordingEncoderSettings(void);
 
+	static bool VirtualCamActive();
+	static void UpdateVirtualCamOutputSource();
+	static void DestroyVirtualCameraScene();
+	static void DestroyVirtualCamView();
+	static void StopVirtualCam();
+	static void StartVirtualCam();
+	static void DeactivateSources();
+
 public:
 	// Service
 	static bool createService(StreamServiceId serviceId);
@@ -168,28 +186,29 @@ public:
 	static void saveService(void);
 	static void saveService(obs_service_t *service, StreamServiceId serviceId);
 	static void updateService(StreamServiceId serviceId);
+	static const char *getStreamOutputType(const obs_service_t *service);
 
 	// Encoders
-	static bool createAudioEncoder(obs_encoder_t **audioEncoder, std::string &id, int bitrate, const char *name, size_t idx);
+	static bool createAudioEncoder(obs_encoder_t **audioEncoder, std::string &id, const std::string &requested_id, int bitrate, const char *name,
+				       size_t idx);
 	static bool createVideoStreamingEncoder(StreamServiceId serviceId);
-	static void createSimpleAudioStreamingEncoder();
+	static std::string GetVideoEncoderName(StreamServiceId serviceId, bool isSimpleMode, bool recording, const char *encoder);
+	static void createAudioStreamingEncoder(StreamServiceId serviceId, bool isSimpleMode, const std::string &encoder_id);
 	static bool createVideoRecordingEncoder();
 	static obs_encoder_t *getStreamingEncoder(StreamServiceId serviceId);
 	static void setStreamingEncoder(obs_encoder_t *encoder, StreamServiceId serviceId);
 	static obs_encoder_t *getRecordingEncoder(void);
 	static void setRecordingEncoder(obs_encoder_t *encoder);
-	static obs_encoder_t *getAudioSimpleStreamingEncoder(void);
-	static void setAudioSimpleStreamingEncoder(obs_encoder_t *encoder);
+	static obs_encoder_t *getAudioStreamingEncoder(StreamServiceId serviceId);
+	static void setAudioStreamingEncoder(obs_encoder_t *encoder, StreamServiceId serviceId);
 	static obs_encoder_t *getAudioSimpleRecordingEncoder(void);
 	static void setAudioSimpleRecordingEncoder(obs_encoder_t *encoder);
-	static obs_encoder_t *getAudioAdvancedStreamingEncoder(void);
-	static void setAudioAdvancedStreamingEncoder(obs_encoder_t *encoder);
-	static void setupAudioEncoder(void);
-	static void clearAudioEncoder(void);
+	static void setupRecordingAudioEncoder(void);
+	static void clearRecordingAudioEncoder(void);
 	static obs_encoder_t *getArchiveEncoder(void);
 
 	// Outputs
-	static std::string getStreamingOutputName(StreamServiceId serviceId);
+	static std::string createStreamingOutputName(StreamServiceId serviceId);
 	static bool createStreamingOutput(StreamServiceId serviceId);
 	static bool createRecordingOutput(void);
 	static void createReplayBufferOutput(void);
@@ -214,14 +233,14 @@ public:
 	static void updateAudioStreamingEncoder(bool isSimpleMode, StreamServiceId serviceId);
 	static void updateAudioRecordingEncoder(bool isSimpleMode);
 	static void updateVideoRecordingEncoder(bool isSimpleMode);
-	static void updateAudioTracks(void);
+	static void updateRecordingAudioTracks(void);
 
 	// Update outputs
 	static void updateFfmpegOutput(bool isSimpleMode, obs_output_t *output);
 	static void UpdateFFmpegCustomOutput(void);
 	static void updateReplayBufferOutput(bool isSimpleMode, bool useStreamEncoder);
 	static void stopConnectingOutputs();
-
+	static void LoadRecordingPreset_Lossy(const char *encoderId);
 	static std::string GetDefaultVideoSavePath(void);
 
 	static bool isStreamingOutputActive(StreamServiceId serviceId);
@@ -254,7 +273,6 @@ public:
 
 	static void duplicate_encoder(obs_encoder_t **dst, obs_encoder_t *src, uint64_t trackIndex = 0);
 
-	static bool EncoderAvailable(const char *encoder);
 	static void stopAllOutputs(void);
 
 	static bool startTwitchSoundtrackAudio(void);

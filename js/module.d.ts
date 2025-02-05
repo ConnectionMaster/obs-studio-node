@@ -109,6 +109,11 @@ export declare const enum ETextType {
     Multiline = 2,
     TextInfo = 3
 }
+export declare const enum ETextInfoType {
+    Normal = 0,
+    Warning = 1,
+    Error = 2
+}
 export declare const enum ENumberType {
     Scroller = 0,
     Slider = 1
@@ -142,7 +147,8 @@ export declare const enum ESourceOutputFlags {
     Composite = 64,
     DoNotDuplicate = 128,
     Deprecated = 256,
-    DoNotSelfMonitor = 512
+    DoNotSelfMonitor = 512,
+    ForceUiRefresh = 1073741824
 }
 export declare const enum ESceneDupType {
     Refs = 0,
@@ -348,6 +354,8 @@ export interface IGlobal {
     getOutputFlagsFromId(id: string): number;
     setOutputSource(channel: number, input: ISource): void;
     getOutputSource(channel: number): ISource;
+    addSceneToBackstage(input: ISource): void;
+    removeSceneFromBackstage(input: ISource): void;
     readonly totalFrames: number;
     readonly laggedFrames: number;
     readonly initialized: boolean;
@@ -397,6 +405,7 @@ export interface ITextProperty extends IProperty {
 }
 export interface ITextDetails {
     readonly type: ETextType;
+    readonly infoType: ETextInfoType;
 }
 export interface INumberProperty extends IProperty {
     readonly details: INumberDetails;
@@ -549,7 +558,7 @@ export interface ISceneItem {
     streamVisible: boolean;
     recordingVisible: boolean;
     video: IVideo;
-    readonly transformInfo: ITransformInfo;
+    transformInfo: ITransformInfo;
     crop: ICropInfo;
     moveUp(): void;
     moveDown(): void;
@@ -603,8 +612,6 @@ export interface IFader {
     destroy(): void;
     attach(source: IInput): void;
     detach(): void;
-    addCallback(cb: (db: number) => void): ICallbackData;
-    removeCallback(cbData: ICallbackData): void;
 }
 export interface IVolmeterFactory {
     create(type: EFaderType): IVolmeter;
@@ -614,8 +621,6 @@ export interface IVolmeter {
     destroy(): void;
     attach(source: IInput): void;
     detach(): void;
-    addCallback(cb: (magnitude: number[], peak: number[], inputPeak: number[]) => void): ICallbackData;
-    removeCallback(cbData: ICallbackData): void;
 }
 export interface ICallbackData {
 }
@@ -632,7 +637,6 @@ export interface IDisplay {
     getPreviewSize(x: number, y: number): void;
     shouldDrawUI: boolean;
     paddingSize: number;
-    video: IVideo;
     setPaddingColor(r: number, g: number, b: number, a: number): void;
     setBackgroundColor(r: number, g: number, b: number, a: number): void;
     setOutlineColor(r: number, g: number, b: number, a: number): void;
@@ -743,7 +747,7 @@ export declare const enum ERecordingFormat {
     FLV = "flv",
     MOV = "mov",
     MKV = "mkv",
-    TS = "ts",
+    TS = "mpegts",
     M3M8 = "m3m8"
 }
 export declare const enum ERecordingQuality {
@@ -937,4 +941,11 @@ export interface IAudioTrackFactory {
     importLegacySettings(): void;
     saveLegacySettings(): void;
 }
+export declare const enum VCamOutputType {
+	Invalid,
+	SceneOutput,
+	SourceOutput,
+	ProgramView,
+	PreviewOutput,
+};
 export declare const NodeObs: any;

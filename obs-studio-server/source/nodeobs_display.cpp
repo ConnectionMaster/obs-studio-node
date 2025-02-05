@@ -161,17 +161,14 @@ private:
 
 				BOOL enabled = FALSE;
 				DwmIsCompositionEnabled(&enabled);
-				DWORD windowStyle;
+				DWORD windowStyle = WS_EX_TRANSPARENT;
 
-				if (IsWindows8OrGreater() || !enabled) {
-					windowStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST;
-				} else {
-					windowStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_COMPOSITED;
+				if (IsWindows8OrGreater() && enabled) {
+					windowStyle |= WS_EX_COMPOSITED;
 				}
 
-				HWND newWindow = CreateWindowEx(windowStyle, TEXT("Win32DisplayClass"), TEXT("SlobsChildWindowPreview"),
-								WS_VISIBLE | WS_POPUP | WS_CHILD, 0, 0, question->m_width, question->m_height, NULL, NULL, NULL,
-								this);
+				HWND newWindow = CreateWindowEx(WS_EX_LAYERED, TEXT("Win32DisplayClass"), TEXT("SlobsChildWindowPreview"), WS_POPUP, 0, 0, 0, 0,
+								NULL, NULL, GetModuleHandle(NULL), this);
 
 				if (!newWindow) {
 					answer->m_success = false;
@@ -182,6 +179,16 @@ private:
 					}
 
 					SetParent(newWindow, question->m_parentWindow);
+
+					LONG_PTR style = GetWindowLongPtr(newWindow, GWL_STYLE);
+					style &= ~WS_POPUP;
+					style |= WS_CHILD;
+					SetWindowLongPtr(newWindow, GWL_STYLE, style);
+
+					LONG_PTR exStyle = GetWindowLongPtr(newWindow, GWL_EXSTYLE);
+					exStyle |= windowStyle;
+					SetWindowLongPtr(newWindow, GWL_EXSTYLE, exStyle);
+
 					answer->m_windowHandle = newWindow;
 					answer->m_success = true;
 				}
@@ -193,6 +200,20 @@ private:
 			case Message::DestroyWindow: {
 				DestroyWindowMessageQuestion *question = reinterpret_cast<DestroyWindowMessageQuestion *>(message.wParam);
 				DestroyWindowMessageAnswer *answer = reinterpret_cast<DestroyWindowMessageAnswer *>(message.lParam);
+
+				LONG_PTR exStyle = GetWindowLongPtr(question->m_window, GWL_EXSTYLE);
+				if (exStyle == 0) {
+					DWORD error = GetLastError();
+					blog(LOG_ERROR, "Destroy Display Window failed to get GWL_EXSTYLE. Error code: %08X", error);
+				}
+
+				LONG_PTR style = GetWindowLongPtr(question->m_window, GWL_STYLE);
+				if (style == 0) {
+					DWORD error = GetLastError();
+					blog(LOG_ERROR, "Destroy Display Window failed to get GWL_STYLE. Error code: %08X", error);
+				}
+
+				blog(LOG_INFO, "Destroy Display Window: exStyle: %08X, style: %08X", exStyle, style);
 
 				if (!DestroyWindow(question->m_window)) {
 					auto error = GetLastError();
@@ -455,6 +476,14 @@ OBS::Display::Display(uint64_t windowHandle, enum obs_video_rendering_mode mode,
 	SystemWorkerThread::CreateWindowMessageAnswer answer;
 
 	question.m_parentWindow = (HWND)windowHandle;
+
+	RECT parentWindowRect = {};
+	GetWindowRect((HWND)windowHandle, &parentWindowRect);
+
+	blog(LOG_INFO, "[DISPLAY_SCALE] OBS::Display::Display() parent window [x*y: %d*%d] [w*h: %d*%d]; this window [w*h: %u*%u]; display: %p",
+	     parentWindowRect.left, parentWindowRect.top, parentWindowRect.right - parentWindowRect.left, parentWindowRect.bottom - parentWindowRect.top,
+	     m_gsInitData.cx, m_gsInitData.cy, this);
+
 	question.m_width = m_gsInitData.cx;
 	question.m_height = m_gsInitData.cy;
 	while (!m_systemWorkerThread->PostMessage(question, &answer)) {
@@ -476,6 +505,11 @@ OBS::Display::Display(uint64_t windowHandle, enum obs_video_rendering_mode mode,
 	m_ourWindow = answer.m_windowHandle;
 	m_parentWindow = reinterpret_cast<HWND>(windowHandle);
 	m_gsInitData.window.hwnd = reinterpret_cast<void *>(m_ourWindow);
+
+	DPI_AWARENESS dpiAwareness = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+	UINT dpi = GetDpiForWindow(m_ourWindow);
+	blog(LOG_INFO, "[DISPLAY_SCALE] OBS::Display::Display() dpiAwareness: %d; dpi: %u; display: %p", (int)dpiAwareness, dpi, this);
+
 #endif
 	{
 		std::lock_guard lock(m_displayMtx);
@@ -501,6 +535,9 @@ OBS::Display::Display(uint64_t windowHandle, enum obs_video_rendering_mode mode,
 {
 	m_source = obs_get_source_by_name(sourceName.c_str());
 	obs_source_inc_showing(m_source);
+	if (m_source && obs_source_get_type(m_source) == OBS_SOURCE_TYPE_SCENE) {
+		obs_activate_scene_on_backstage(m_source);
+	}
 }
 
 OBS::Display::~Display()
@@ -511,6 +548,9 @@ OBS::Display::~Display()
 		obs_display_remove_draw_callback(m_display, DisplayCallback, this);
 
 		if (m_source) {
+			if (obs_source_get_type(m_source) == OBS_SOURCE_TYPE_SCENE) {
+				obs_deactivate_scene_on_backstage(m_source);
+			}
 			obs_source_dec_showing(m_source);
 			obs_source_release(m_source);
 		}
@@ -584,6 +624,9 @@ void OBS::Display::SetPosition(uint32_t x, uint32_t y)
 		blog(LOG_DEBUG, msg.c_str(), obs_source_get_name(m_source), x, y, m_ourWindow);
 	}
 
+	blog(LOG_INFO, "[DISPLAY_SCALE] Display::SetPosition() - Pos: %ux%u, Size: %ux%u, Window: 0x%p; display: %p", m_position.first, m_position.second,
+	     m_gsInitData.cx, m_gsInitData.cy, (void *)m_ourWindow, this);
+
 	HWND insertAfter = (m_renderAtBottom) ? HWND_BOTTOM : NULL;
 	SetWindowPos(m_ourWindow, insertAfter, m_position.first, m_position.second, m_gsInitData.cx, m_gsInitData.cy,
 		     SWP_NOCOPYBITS | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -653,6 +696,10 @@ void OBS::Display::setSizeCall(int step)
 		break;
 	}
 
+	blog(LOG_INFO, "[DISPLAY_SCALE] Display::setSizeCall() - Pos: %ux%u, Size: %ux%u, DPI Aware: %d, DPI: %u, Window: 0x%p; display: %p", use_x, use_y,
+	     use_width, use_height, (int)GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()), GetDpiForWindow(m_ourWindow), (void *)m_ourWindow,
+	     this);
+
 	// Resize Window
 	if (step > 0) {
 		ret = SetWindowPos(m_ourWindow, NULL, use_x, use_y, use_width, use_height, SWP_NOCOPYBITS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_HIDEWINDOW);
@@ -679,6 +726,8 @@ void OBS::Display::SetSize(uint32_t width, uint32_t height)
 		blog(LOG_DEBUG, msg.c_str(), obs_source_get_name(m_source), width, height, m_ourWindow);
 	}
 
+	blog(LOG_INFO, "[DISPLAY_SCALE] OBS::Display::SetSize() [w*h: %u*%u]; display: %p", width, height, this);
+
 	m_gsInitData.cx = width;
 	m_gsInitData.cy = height;
 
@@ -698,6 +747,8 @@ void OBS::Display::SetSize(uint32_t width, uint32_t height)
 
 std::pair<uint32_t, uint32_t> OBS::Display::GetSize()
 {
+	blog(LOG_INFO, "[DISPLAY_SCALE] OBS::Display::GetSize() [w*h: %u*%u]; display: %p", m_gsInitData.cx, m_gsInitData.cy, this);
+
 	return std::make_pair(m_gsInitData.cx, m_gsInitData.cy);
 }
 
@@ -1387,6 +1438,9 @@ void OBS::Display::DisplayCallback(void *displayPtr, uint32_t cx, uint32_t cy)
 	gs_technique_t *solid_tech = gs_effect_get_technique(solid, "Solid");
 	vec4 color;
 
+	if (dp->m_canvas)
+		obs_set_video_rendering_canvas(dp->m_canvas);
+
 	dp->UpdatePreviewArea();
 
 	// Get proper source/base size.
@@ -1394,26 +1448,23 @@ void OBS::Display::DisplayCallback(void *displayPtr, uint32_t cx, uint32_t cy)
 	if (dp->m_source) {
 		sourceW = obs_source_get_width(dp->m_source);
 		sourceH = obs_source_get_height(dp->m_source);
-		if (sourceW == 0)
-			sourceW = 1;
-		if (sourceH == 0)
-			sourceH = 1;
-	} else {
+	}
+	if (sourceW <= 1 || sourceH <= 1) {
 		if (dp->m_canvas) {
 			sourceW = dp->m_canvas->base_width;
 			sourceH = dp->m_canvas->base_height;
 		}
-
-		if (sourceW == 0)
-			sourceW = 1;
-		if (sourceH == 0)
-			sourceH = 1;
 	}
+
+	if (sourceW == 0)
+		sourceW = 1;
+	if (sourceH == 0)
+		sourceH = 1;
 
 	// Get a source and its scene for the UI effects
 	obs_source_t *source = dp->GetSourceForUIEffects();
 
-	/* This should work for both individual sources 
+	/* This should work for both individual sources
 	 * that are actually scenes and our main transition scene */
 	obs_scene_t *scene = (source) ? obs_scene_from_source(source) : nullptr;
 
@@ -1473,8 +1524,8 @@ void OBS::Display::DisplayCallback(void *displayPtr, uint32_t cx, uint32_t cy)
 
 	// Source Rendering
 	if (dp->m_source) {
-		/* If the source is a transition it means this display 
-		 * is for Studio Mode and that the scene it contains is a 
+		/* If the source is a transition it means this display
+		 * is for Studio Mode and that the scene it contains is a
 		 * duplicate of the current scene, apply selective recording
 		 * layer rendering if it is enabled */
 		if (obs_get_multiple_rendering() && obs_source_get_type(dp->m_source) == OBS_SOURCE_TYPE_TRANSITION)
@@ -1536,7 +1587,7 @@ obs_source_t *OBS::Display::GetSourceForUIEffects()
 			source = obs_transition_get_active_source(m_source);
 		} else {
 			source = m_source;
-			obs_source_addref(source);
+			obs_source_get_ref(source);
 		}
 	} else {
 		/* Here we assume that channel 0 holds the primary transition.
@@ -1556,7 +1607,8 @@ void OBS::Display::UpdatePreviewArea()
 	if (m_source) {
 		sourceW = obs_source_get_width(m_source);
 		sourceH = obs_source_get_height(m_source);
-	} else {
+	}
+	if (sourceW <= 1 || sourceH <= 1) {
 		if (m_canvas) {
 			sourceW = m_canvas->base_width;
 			sourceH = m_canvas->base_height;
@@ -1599,17 +1651,28 @@ WNDCLASSEX OBS::Display::DisplayWndClassObj;
 
 ATOM OBS::Display::DisplayWndClassAtom;
 
+std::mutex displayWndClassMutex; // Global or class-level static mutex
+
 void OBS::Display::DisplayWndClass()
 {
+	std::lock_guard<std::mutex> lock(displayWndClassMutex);
 	if (DisplayWndClassRegistered)
 		return;
 
+	DWORD style = CS_NOCLOSE | CS_HREDRAW | CS_VREDRAW; // CS_DBLCLKS | CS_HREDRAW | CS_NOCLOSE | CS_VREDRAW | CS_OWNDC;
+	BOOL enabled = FALSE;
+	DwmIsCompositionEnabled(&enabled);
+
+	if (IsWindows8OrGreater() || !enabled) {
+		style |= CS_OWNDC;
+	}
+
 	DisplayWndClassObj.cbSize = sizeof(WNDCLASSEX);
-	DisplayWndClassObj.style = CS_OWNDC | CS_NOCLOSE | CS_HREDRAW | CS_VREDRAW; // CS_DBLCLKS | CS_HREDRAW | CS_NOCLOSE | CS_VREDRAW | CS_OWNDC;
+	DisplayWndClassObj.style = style;
 	DisplayWndClassObj.lpfnWndProc = DisplayWndProc;
 	DisplayWndClassObj.cbClsExtra = 0;
 	DisplayWndClassObj.cbWndExtra = 0;
-	DisplayWndClassObj.hInstance = NULL; // HINST_THISCOMPONENT;
+	DisplayWndClassObj.hInstance = GetModuleHandle(NULL); // HINST_THISCOMPONENT;
 	DisplayWndClassObj.hIcon = NULL;
 	DisplayWndClassObj.hCursor = NULL;
 	DisplayWndClassObj.hbrBackground = NULL;

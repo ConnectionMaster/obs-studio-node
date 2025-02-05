@@ -389,17 +389,19 @@ void OBS_content::OBS_content_resizeDisplay(void *data, const int64_t id, const 
 
 	OBS::Display *display = value->second;
 
+	blog(LOG_INFO, ">> OBS_content::OBS_content_resizeDisplay() width: %u; height: %u", args[1].value_union.ui32, args[2].value_union.ui32);
+
 	display->m_gsInitData.cx = args[1].value_union.ui32;
 	display->m_gsInitData.cy = args[2].value_union.ui32;
 
+#ifdef WIN32
+	display->SetSize(display->m_gsInitData.cx, display->m_gsInitData.cy);
+#else
 	// Resize Display
 	obs_display_resize(display->m_display, display->m_gsInitData.cx, display->m_gsInitData.cy);
 
 	// Store new size.
 	display->UpdatePreviewArea();
-
-#ifdef WIN32
-	display->SetSize(display->m_gsInitData.cx, display->m_gsInitData.cy);
 #endif
 	rval.push_back(ipc::value((uint64_t)ErrorCode::Ok));
 	AUTO_DEBUG;

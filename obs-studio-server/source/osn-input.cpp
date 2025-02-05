@@ -112,12 +112,12 @@ void osn::Input::Create(void *data, const int64_t id, const std::vector<ipc::val
 	}
 
 	obs_source_t *source = obs_source_create(sourceId.c_str(), name.c_str(), settings, hotkeys);
+	obs_data_release(hotkeys);
+	obs_data_release(settings);
+
 	if (!source) {
 		PRETTY_ERROR_RETURN(ErrorCode::Error, "Failed to create input.");
 	}
-
-	obs_data_release(hotkeys);
-	obs_data_release(settings);
 
 	uint64_t uid = osn::Source::Manager::GetInstance().find(source);
 	if (uid == UINT64_MAX) {
@@ -127,7 +127,7 @@ void osn::Input::Create(void *data, const int64_t id, const std::vector<ipc::val
 
 	rval.push_back(ipc::value((uint64_t)ErrorCode::Ok));
 	rval.push_back(ipc::value(uid));
-	rval.push_back(ipc::value(obs_data_get_full_json(settingsSource)));
+	rval.push_back(ipc::value(obs_data_get_json_pretty(settingsSource)));
 	rval.push_back(ipc::value(obs_source_get_audio_mixers(source)));
 	rval.push_back(ipc::value((uint32_t)obs_source_get_deinterlace_mode(source)));
 	rval.push_back(ipc::value((uint32_t)obs_source_get_deinterlace_field_order(source)));

@@ -99,7 +99,13 @@
 #define GBYTE (1024ULL * 1024ULL * 1024ULL)
 #define TBYTE (1024ULL * 1024ULL * 1024ULL * 1024ULL)
 
-enum crashHandlerCommand { REGISTER = 0, UNREGISTER = 1, REGISTERMEMORYDUMP = 2, CRASHWITHCODE = 3 };
+enum crashHandlerCommand {
+	REGISTER = 0,
+	UNREGISTER = 1,
+	REGISTERMEMORYDUMP = 2,
+	CRASHWITHCODE = 3,
+	CRASHED_MODULE_INFO = 4,
+};
 
 struct NodeOBSLogParam final {
 	std::fstream logStream;
@@ -115,7 +121,8 @@ HMODULE hRtwq;
 std::string slobs_plugin;
 std::vector<std::pair<std::string, obs_module_t *>> obsModules;
 OBS_API::LogReport logReport;
-OBS_API::OutputStats streamingOutputStats;
+OBS_API::OutputStats streamingOutputStatsMain;
+OBS_API::OutputStats streamingOutputStatsSecondary;
 OBS_API::OutputStats recordingOutputStats;
 std::mutex logMutex;
 std::string currentVersion;
@@ -599,6 +606,7 @@ std::vector<char> registerProcess(void)
 
 std::vector<char> registerMemoryDump(void)
 {
+	blog(LOG_INFO, "registerMemoryDump");
 	const uint8_t action = crashHandlerCommand::REGISTERMEMORYDUMP;
 
 	//str
@@ -698,6 +706,35 @@ std::vector<char> crashedProcess(uint32_t crash_id)
 	return buffer;
 }
 
+std::vector<char> crashedModuleInfo(const std::string &moduleName, const std::string &binaryPath)
+{
+	std::vector<char> buffer;
+
+	// Prepare
+	const std::uint8_t messageAction = crashHandlerCommand::CRASHED_MODULE_INFO;
+	const std::uint32_t messageModuleNameSize = (moduleName.size() + 1) * sizeof(std::remove_reference<decltype(moduleName)>::type::value_type);
+	const std::uint32_t messageBinaryPathSize = (binaryPath.size() + 1) * sizeof(std::remove_reference<decltype(binaryPath)>::type::value_type);
+
+	buffer.resize(sizeof(messageAction) + sizeof(std::uint32_t) + messageModuleNameSize + sizeof(std::uint32_t) + messageBinaryPathSize);
+
+	// Pack
+	uint32_t offset = 0;
+	memcpy(buffer.data(), &messageAction, sizeof(messageAction));
+	offset++;
+
+	memcpy(buffer.data() + offset, &messageModuleNameSize, sizeof(messageModuleNameSize));
+	offset += sizeof(messageModuleNameSize);
+	memcpy(buffer.data() + offset, moduleName.data(), messageModuleNameSize);
+	offset += messageModuleNameSize;
+
+	memcpy(buffer.data() + offset, &messageBinaryPathSize, sizeof(messageBinaryPathSize));
+	offset += sizeof(messageBinaryPathSize);
+	memcpy(buffer.data() + offset, binaryPath.data(), messageBinaryPathSize);
+	offset += messageBinaryPathSize;
+
+	return buffer;
+}
+
 #ifdef WIN32
 std::wstring crash_handler_pipe;
 
@@ -792,6 +829,31 @@ void addModulePaths()
 #endif
 }
 
+static void listEncoders(obs_encoder_type type)
+{
+	constexpr uint32_t hide_flags = OBS_ENCODER_CAP_DEPRECATED | OBS_ENCODER_CAP_INTERNAL;
+
+	size_t idx = 0;
+	const char *encoder_type;
+
+	while (obs_enum_encoder_types(idx++, &encoder_type)) {
+		if (obs_get_encoder_caps(encoder_type) & hide_flags || obs_get_encoder_type(encoder_type) != type) {
+			continue;
+		}
+
+		blog(LOG_INFO, "\t- %s (%s)", encoder_type, obs_encoder_get_display_name(encoder_type));
+	}
+};
+
+static void logEncoders()
+{
+	blog(LOG_INFO, "Available Encoders:");
+	blog(LOG_INFO, "  Video Encoders:");
+	listEncoders(OBS_ENCODER_VIDEO);
+	blog(LOG_INFO, "  Audio Encoders:");
+	listEncoders(OBS_ENCODER_AUDIO);
+}
+
 void OBS_API::OBS_API_initAPI(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval)
 {
 	writeCrashHandler(registerProcess());
@@ -807,6 +869,43 @@ void OBS_API::OBS_API_initAPI(void *data, const int64_t id, const std::vector<ip
 	std::string locale = args[1].value_str;
 	currentVersion = args[2].value_str;
 	utility::osn_current_version(currentVersion);
+
+	/* Logging */
+	std::string filename = GenerateTimeDateFilename("txt");
+	std::string log_path = appdata;
+	log_path.append("/node-obs/logs/");
+
+	/* Make sure the path is created
+	before attempting to make a file there. */
+	if (os_mkdirs(log_path.c_str()) == MKDIR_ERROR) {
+		std::cerr << "Failed to open log file" << std::endl;
+#ifdef WIN32
+		util::CrashManager::AddWarning("Error on log file, failed to create path: " + log_path);
+#endif
+	}
+
+	/* Delete oldest file in the folder to imitate rotating */
+	DeleteOldestFile(log_path.c_str(), 3);
+	log_path.append(filename);
+
+	auto logParam = std::make_unique<NodeOBSLogParam>();
+	logParam->enableDebugLogs = checkIfDebugLogsEnabled(appdata);
+
+#if defined(_WIN32) && defined(UNICODE)
+	logParam->logStream = std::fstream(converter.from_bytes(log_path.c_str()).c_str(), std::ios_base::out | std::ios_base::trunc);
+#else
+	logParam->logStream = std::fstream(log_path, std::ios_base::out | std::ios_base::trunc);
+#endif
+	if (!logParam->logStream.is_open()) {
+		logParam.reset();
+		util::CrashManager::AddWarning("Error on log file, failed to open: " + log_path);
+		std::cerr << "Failed to open log file" << std::endl;
+	}
+	base_set_log_handler(node_obs_log, (logParam) ? logParam.release() : nullptr);
+#ifndef _DEBUG
+	// Redirect the ipc log callbacks to our log handler
+	ipc::register_log_callback([](void *data, const char *fmt, va_list args) { blogva(LOG_ERROR, fmt, args); }, nullptr);
+#endif
 
 #ifdef ENABLE_CRASHREPORT
 	util::CrashManager crashManager;
@@ -867,43 +966,6 @@ void OBS_API::OBS_API_initAPI(void *data, const int64_t id, const std::vector<ip
 #endif
 	}
 
-	/* Logging */
-	std::string filename = GenerateTimeDateFilename("txt");
-	std::string log_path = appdata;
-	log_path.append("/node-obs/logs/");
-
-	/* Make sure the path is created
-	before attempting to make a file there. */
-	if (os_mkdirs(log_path.c_str()) == MKDIR_ERROR) {
-		std::cerr << "Failed to open log file" << std::endl;
-#ifdef WIN32
-		util::CrashManager::AddWarning("Error on log file, failed to create path: " + log_path);
-#endif
-	}
-
-	/* Delete oldest file in the folder to imitate rotating */
-	DeleteOldestFile(log_path.c_str(), 3);
-	log_path.append(filename);
-
-	auto logParam = std::make_unique<NodeOBSLogParam>();
-	logParam->enableDebugLogs = checkIfDebugLogsEnabled(appdata);
-
-#if defined(_WIN32) && defined(UNICODE)
-	logParam->logStream = std::fstream(converter.from_bytes(log_path.c_str()).c_str(), std::ios_base::out | std::ios_base::trunc);
-#else
-	logParam->logStream = std::fstream(log_path, std::ios_base::out | std::ios_base::trunc);
-#endif
-	if (!logParam->logStream.is_open()) {
-		logParam.reset();
-		util::CrashManager::AddWarning("Error on log file, failed to open: " + log_path);
-		std::cerr << "Failed to open log file" << std::endl;
-	}
-	base_set_log_handler(node_obs_log, (logParam) ? logParam.release() : nullptr);
-#ifndef _DEBUG
-	// Redirect the ipc log callbacks to our log handler
-	ipc::register_log_callback([](void *data, const char *fmt, va_list args) { blogva(LOG_ERROR, fmt, args); }, nullptr);
-#endif
-
 #ifdef _WIN32
 	SetPrivilegeForGPUPriority();
 #endif
@@ -924,6 +986,8 @@ void OBS_API::OBS_API_initAPI(void *data, const int64_t id, const std::vector<ip
 	addModulePaths();
 	struct obs_module_failure_info mfi;
 	obs_load_all_modules2(&mfi);
+	obs_log_loaded_modules();
+	obs_post_load_modules();
 
 	if (mfi.count) {
 		char **plugin = mfi.failed_modules;
@@ -946,7 +1010,7 @@ void OBS_API::OBS_API_initAPI(void *data, const int64_t id, const std::vector<ip
 
 	OBS_service::resetAudioContext();
 
-	OBS_service::setupAudioEncoder();
+	OBS_service::setupRecordingAudioEncoder();
 
 	setAudioDeviceMonitoring();
 
@@ -965,6 +1029,12 @@ void OBS_API::OBS_API_initAPI(void *data, const int64_t id, const std::vector<ip
 	obs_set_replay_buffer_rendering_mode(useStreamOutput ? OBS_STREAMING_REPLAY_BUFFER_RENDERING : OBS_RECORDING_REPLAY_BUFFER_RENDERING);
 
 	util::CrashManager::setAppState("idle");
+
+	blog(LOG_INFO, "---------------------------------");
+	obs_log_loaded_modules();
+	blog(LOG_INFO, "---------------------------------");
+	logEncoders();
+	blog(LOG_INFO, "---------------------------------");
 
 	// We are returning a video result here because the frontend needs to know if we sucessfully
 	// initialized the Dx11 API
@@ -996,9 +1066,9 @@ void OBS_API::OBS_API_getPerformanceStatistics(void *data, const int64_t id, con
 	rval.push_back(ipc::value(getNumberOfDroppedFrames()));
 	rval.push_back(ipc::value(getDroppedFramesPercentage()));
 
-	getCurrentOutputStats(OBS_service::getStreamingOutput(StreamServiceId::Main), streamingOutputStats);
-	rval.push_back(ipc::value(streamingOutputStats.kbitsPerSec));
-	rval.push_back(ipc::value(streamingOutputStats.dataOutput));
+	getCurrentOutputStats(OBS_service::getStreamingOutput(StreamServiceId::Main), streamingOutputStatsMain);
+	rval.push_back(ipc::value(streamingOutputStatsMain.kbitsPerSec));
+	rval.push_back(ipc::value(streamingOutputStatsMain.dataOutput));
 
 	getCurrentOutputStats(OBS_service::getRecordingOutput(), recordingOutputStats);
 	rval.push_back(ipc::value(recordingOutputStats.kbitsPerSec));
@@ -1009,9 +1079,9 @@ void OBS_API::OBS_API_getPerformanceStatistics(void *data, const int64_t id, con
 	rval.push_back(ipc::value(getMemoryUsage()));
 	rval.push_back(ipc::value(getDiskSpaceAvailable()));
 
-	getCurrentOutputStats(OBS_service::getStreamingOutput(StreamServiceId::Second), streamingOutputStats);
-	rval.push_back(ipc::value(streamingOutputStats.kbitsPerSec));
-	rval.push_back(ipc::value(streamingOutputStats.dataOutput));
+	getCurrentOutputStats(OBS_service::getStreamingOutput(StreamServiceId::Second), streamingOutputStatsSecondary);
+	rval.push_back(ipc::value(streamingOutputStatsSecondary.kbitsPerSec));
+	rval.push_back(ipc::value(streamingOutputStatsSecondary.dataOutput));
 	AUTO_DEBUG;
 }
 
@@ -1517,6 +1587,11 @@ void OBS_API::InformCrashHandler(const int crash_id)
 	writeCrashHandler(crashedProcess(crash_id));
 }
 
+void OBS_API::CrashModuleInfo(const std::string &moduleName, const std::string &binaryPath)
+{
+	writeCrashHandler(crashedModuleInfo(moduleName, binaryPath));
+}
+
 void OBS_API::destroyOBS_API(void)
 {
 	blog(LOG_DEBUG, "OBS_API::destroyOBS_API started, objects allocated %d", bnum_allocs());
@@ -1560,11 +1635,8 @@ void OBS_API::destroyOBS_API(void)
 		recordingEncoder = nullptr;
 	}
 
-	obs_encoder_t *audioStreamingEncoder = OBS_service::getAudioSimpleStreamingEncoder();
-	if (audioStreamingEncoder != NULL) {
-		obs_encoder_release(audioStreamingEncoder);
-		audioStreamingEncoder = nullptr;
-	}
+	OBS_service::setAudioStreamingEncoder(nullptr, StreamServiceId::Main);
+	OBS_service::setAudioStreamingEncoder(nullptr, StreamServiceId::Second);
 
 	obs_encoder_t *audioRecordingEncoder = OBS_service::getAudioSimpleRecordingEncoder();
 	if (audioRecordingEncoder != NULL && (OBS_service::useRecordingPreset() || obs_get_multiple_rendering())) {
@@ -1625,7 +1697,7 @@ void OBS_API::destroyOBS_API(void)
 		service = nullptr;
 	}
 
-	OBS_service::clearAudioEncoder();
+	OBS_service::clearRecordingAudioEncoder();
 	osn::Volmeter::ClearVolmeters();
 	osn::Fader::ClearFaders();
 
@@ -1783,6 +1855,7 @@ void OBS_API::destroyOBS_API(void)
 		blog(LOG_WARNING, "OBS_API::destroyOBS_API - obs_wait_for_destroy_queue has finished, osn::Source::Manager::GetInstance() size is %d",
 		     osn::Source::Manager::GetInstance().size());
 		osn::Source::Manager::GetInstance().for_each([&sources](obs_source_t *source) { osn::Source::detach_source_signals(source); });
+		MemoryManager::GetInstance().shutdownAllSources();
 
 #ifdef WIN32
 		// Directly blame the frontend since it didn't release all objects and that could cause

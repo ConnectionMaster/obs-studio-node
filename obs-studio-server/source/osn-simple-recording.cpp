@@ -172,16 +172,10 @@ static obs_data_t *UpdateRecordingSettings_x264_crf(int crf, bool lowCPU)
 static obs_data_t *UpdateRecordingSettings_amd_cqp(int cqp)
 {
 	obs_data_t *settings = obs_data_create();
-	obs_data_set_int(settings, "Usage", 0);
-	obs_data_set_int(settings, "Profile", 100); // High
-	obs_data_set_int(settings, "RateControlMethod", 0);
-	obs_data_set_int(settings, "QP.IFrame", cqp);
-	obs_data_set_int(settings, "QP.PFrame", cqp);
-	obs_data_set_int(settings, "QP.BFrame", cqp);
-	obs_data_set_int(settings, "VBVBuffer", 1);
-	obs_data_set_int(settings, "VBVBuffer.Size", 100000);
-	obs_data_set_double(settings, "KeyframeInterval", 2.0);
-	obs_data_set_int(settings, "BFrame.Pattern", 0);
+	obs_data_set_string(settings, "rate_control", "CQP");
+	obs_data_set_string(settings, "profile", "high");
+	obs_data_set_string(settings, "preset", "quality");
+	obs_data_set_int(settings, "cqp", cqp);
 	return settings;
 }
 
@@ -378,6 +372,7 @@ void osn::ISimpleRecording::Start(void *data, const int64_t id, const std::vecto
 
 		obs_encoder_set_audio(recording->audioEncoder, obs_get_audio());
 		obs_output_set_audio_encoder(recording->output, recording->audioEncoder, 0);
+		obs_encoder_set_video_mix(recording->audioEncoder, obs_video_mix_get(recording->canvas, OBS_RECORDING_VIDEO_RENDERING));
 
 		obs_output_set_video_encoder(recording->output, recording->videoEncoder);
 	}
@@ -468,7 +463,7 @@ obs_encoder_t *osn::ISimpleRecording::GetLegacyVideoEncoderSettings()
 	} else if (strcmp(encId, SIMPLE_ENCODER_QSV) == 0 || strcmp(encId, ADVANCED_ENCODER_QSV) == 0) {
 		encIdOBS = "obs_qsv11";
 	} else if (strcmp(encId, SIMPLE_ENCODER_AMD) == 0 || strcmp(encId, ADVANCED_ENCODER_AMD) == 0) {
-		encIdOBS = "amd_amf_h264";
+		encIdOBS = "h264_texture_amf";
 	} else if (strcmp(encId, SIMPLE_ENCODER_NVENC) == 0 || strcmp(encId, ADVANCED_ENCODER_NVENC) == 0) {
 		encIdOBS = "ffmpeg_nvenc";
 	} else if (strcmp(encId, ENCODER_NEW_NVENC) == 0) {
@@ -634,7 +629,7 @@ void osn::ISimpleRecording::SetLegacySettings(void *data, const int64_t id, cons
 			encId = SIMPLE_ENCODER_X264_LOWCPU;
 		} else if (strcmp(encIdOBS, "obs_qsv11") == 0) {
 			encId = SIMPLE_ENCODER_QSV;
-		} else if (strcmp(encIdOBS, "amd_amf_h264") == 0) {
+		} else if (strcmp(encIdOBS, "h264_texture_amf") == 0) {
 			encId = SIMPLE_ENCODER_AMD;
 		} else if (strcmp(encIdOBS, "ffmpeg_nvenc") == 0) {
 			encId = SIMPLE_ENCODER_NVENC;

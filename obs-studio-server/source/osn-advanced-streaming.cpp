@@ -238,6 +238,7 @@ static bool setAudioEncoder(osn::AdvancedStreaming *streaming)
 
 	obs_encoder_set_audio(audioTrack->audioEnc, obs_get_audio());
 	obs_output_set_audio_encoder(streaming->output, audioTrack->audioEnc, 0);
+	obs_encoder_set_video_mix(audioTrack->audioEnc, obs_video_mix_get(streaming->canvas, OBS_STREAMING_VIDEO_RENDERING));
 
 	return true;
 }
@@ -285,6 +286,7 @@ static void SetupTwitchSoundtrackAudio(osn::AdvancedStreaming *streaming)
 	}
 
 	obs_output_set_audio_encoder(streaming->output, streaming->streamArchive, kSoundtrackArchiveEncoderIdx);
+	obs_encoder_set_video_mix(streaming->streamArchive, obs_video_mix_get(streaming->canvas, OBS_STREAMING_VIDEO_RENDERING));
 
 	osn::AudioTrack *audioTrack = osn::IAudioTrack::audioTracks[streaming->twitchTrack];
 	if (!audioTrack)
@@ -373,7 +375,7 @@ void osn::IAdvancedStreaming::Start(void *data, const int64_t id, const std::vec
 		PRETTY_ERROR_RETURN(ErrorCode::InvalidReference, "Invalid service.");
 	}
 
-	const char *type = obs_service_get_output_type(streaming->service);
+	const char *type = OBS_service::getStreamOutputType(streaming->service);
 	if (!type)
 		type = "rtmp_output";
 

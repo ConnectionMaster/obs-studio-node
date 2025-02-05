@@ -17,34 +17,25 @@
 ******************************************************************************/
 
 #pragma once
-#include <napi.h>
-#include <thread>
-#include "utility-v8.hpp"
 
-struct VolmeterData {
-	std::string source_name;
-	std::vector<float> magnitude;
-	std::vector<float> peak;
-	std::vector<float> input_peak;
+#include <string>
+
+#ifdef WIN32
+const char *VIRTUAL_CAM_ID = "virtualcam_output";
+#elif __APPLE__
+const char *VIRTUAL_CAM_ID = "virtual_output";
+#endif
+
+enum VCamOutputType {
+	Invalid,
+	SceneOutput,
+	SourceOutput,
+	ProgramView,
+	PreviewOutput,
 };
 
-struct VolmeterDataArray {
-	std::vector<std::unique_ptr<VolmeterData>> items;
+struct VCamConfig {
+	VCamOutputType type = VCamOutputType::ProgramView;
+	std::string scene;
+	std::string source;
 };
-
-namespace osn {
-class Volmeter : public Napi::ObjectWrap<osn::Volmeter> {
-public:
-	uint64_t m_uid;
-
-public:
-	static Napi::FunctionReference constructor;
-	static Napi::Object Init(Napi::Env env, Napi::Object exports);
-	Volmeter(const Napi::CallbackInfo &info);
-
-	static Napi::Value Create(const Napi::CallbackInfo &info);
-	Napi::Value Destroy(const Napi::CallbackInfo &info);
-	Napi::Value Attach(const Napi::CallbackInfo &info);
-	Napi::Value Detach(const Napi::CallbackInfo &info);
-};
-}
