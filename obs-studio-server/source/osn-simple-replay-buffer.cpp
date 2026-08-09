@@ -22,6 +22,7 @@
 #include "shared.hpp"
 #include "nodeobs_audio_encoders.h"
 #include "osn-encoders.hpp"
+#include <util/platform.h>
 
 void osn::ISimpleReplayBuffer::Register(ipc::server &srv)
 {
@@ -145,6 +146,10 @@ void osn::ISimpleReplayBuffer::Start(void *data, const int64_t id, const std::ve
 
 	if (!replayBuffer->path.size()) {
 		PRETTY_ERROR_RETURN(ErrorCode::InvalidReference, "Invalid recording path.");
+	}
+
+	if (!os_is_path_safe(replayBuffer->path.c_str())) {
+		PRETTY_ERROR_RETURN(ErrorCode::InvalidReference, "Unsafe recording path: symbolic links and junctions are not allowed.");
 	}
 
 	const char *rbPrefix = replayBuffer->prefix.c_str();

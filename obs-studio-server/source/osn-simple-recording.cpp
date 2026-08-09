@@ -24,6 +24,7 @@
 #include "nodeobs_audio_encoders.h"
 #include "osn-file-output.hpp"
 #include "osn-encoders.hpp"
+#include <util/platform.h>
 
 void osn::ISimpleRecording::Register(ipc::server &srv)
 {
@@ -399,6 +400,10 @@ void osn::ISimpleRecording::Start(void *data, const int64_t id, const std::vecto
 
 	if (!recording->path.size()) {
 		PRETTY_ERROR_RETURN(ErrorCode::InvalidReference, "Invalid recording path.");
+	}
+
+	if (!os_is_path_safe(recording->path.c_str())) {
+		PRETTY_ERROR_RETURN(ErrorCode::InvalidReference, "Unsafe recording path: symbolic links and junctions are not allowed.");
 	}
 
 	std::string path = recording->path;
