@@ -62,6 +62,10 @@ void osn::ISimpleRecording::Register(ipc::server &srv)
 	cls->register_function(std::make_shared<ipc::function>("SetFileResetTimestamps", std::vector<ipc::type>{ipc::type::UInt64, ipc::type::UInt32},
 							       SetFileResetTimestamps));
 	cls->register_function(std::make_shared<ipc::function>("GetAvailableEncoders", std::vector<ipc::type>{ipc::type::UInt64}, GetAvailableEncoders));
+	cls->register_function(std::make_shared<ipc::function>("GetPrefix", std::vector<ipc::type>{ipc::type::UInt64}, GetPrefix));
+	cls->register_function(std::make_shared<ipc::function>("SetPrefix", std::vector<ipc::type>{ipc::type::UInt64, ipc::type::String}, SetPrefix));
+	cls->register_function(std::make_shared<ipc::function>("GetSuffix", std::vector<ipc::type>{ipc::type::UInt64}, GetSuffix));
+	cls->register_function(std::make_shared<ipc::function>("SetSuffix", std::vector<ipc::type>{ipc::type::UInt64, ipc::type::String}, SetSuffix));
 
 	srv.register_collection(cls);
 }
@@ -84,6 +88,11 @@ void osn::ISimpleRecording::Destroy(void *data, const int64_t id, const std::vec
 	if (!recording) {
 		PRETTY_ERROR_RETURN(ErrorCode::InvalidReference, "Recording reference is not valid.");
 	}
+
+	// Stop before deregistering. The destructor would do this anyway, but by then the object is out
+	// of the manager, and DeleteOutput() can wait up to 20s for the muxer to drain -- a window where
+	// the file is still being written but its claim is invisible to a concurrent Start.
+	recording->DeleteOutput();
 
 	osn::ISimpleRecording::Manager::GetInstance().free(recording);
 	delete recording;
@@ -412,10 +421,9 @@ void osn::ISimpleRecording::Start(void *data, const int64_t id, const std::vecto
 	if (lastChar != '/' && lastChar != '\\')
 		path += "/";
 
-	path += GenerateSpecifiedFilename(format, recording->noSpace, recording->fileFormat, recording->GetCanvas());
+	path += GenerateSpecifiedFilename(format, recording->noSpace, recording->DecoratedFileFormat(), recording->GetCanvas());
 
-	if (!recording->overwrite)
-		FindBestFilename(path, recording->noSpace);
+	FindBestFilename(path, recording->noSpace, recording, recording->overwrite);
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_string(settings, pathProperty.c_str(), path.c_str());

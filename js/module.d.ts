@@ -884,6 +884,8 @@ export interface IFileOutput {
     lastFile(): string;
 }
 export interface IRecording extends IFileOutput {
+    prefix: string;
+    suffix: string;
     videoEncoder: IVideoEncoder;
     enableFileSplit: boolean;
     splitType: ERecSplitType;
