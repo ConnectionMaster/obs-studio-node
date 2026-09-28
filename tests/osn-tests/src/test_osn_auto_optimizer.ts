@@ -438,74 +438,76 @@ describe(testName, function() {
         expect(result.error.code).to.equal('cancelled');
     });
 
-    it('accepts additional unprobed destinations and cancels both concurrent Dual Output hardware workloads before returning', async function() {
-        const verticalCanvas = osn.VideoFactory.create();
-        let nativeRun: AutoOptimizerRun | null = null;
-        try {
-            const started = new Promise<void>((resolve, reject) => {
-                const eventCodes: string[] = [];
-                const timeout = setTimeout(
-                    () => reject(new Error(`Timed out waiting for the concurrent Dual Output workload; events=${eventCodes.join(',')}`)),
-                    15000);
-                nativeRun = autoOptimizer.run(
-                    {
-                        streamSetup: 'dual-output',
-                        outputs: [
-                            output({
-                                outputId: 'horizontal',
-                                display: 'horizontal',
-                                destinations: ['twitch', 'kick'],
-                                probes: [{
-                                    id: 'dual-cancel-twitch',
-                                    kind: 'twitch-standard',
-                                    server: 'rtmp://live.twitch.tv/app',
-                                    streamKey: 'integration-test-twitch-key',
-                                }],
-                            }),
-                            output({
-                                outputId: 'vertical',
-                                display: 'vertical',
-                                destinations: ['youtube'],
-                                current: {
-                                    ...output().current,
-                                    canvasId: verticalCanvas.canvasId,
-                                    width: 720,
-                                    height: 1280,
-                                },
-                                probes: [{
-                                    id: 'dual-cancel-youtube',
-                                    kind: 'youtube-unbound',
-                                    server: 'rtmps://a.rtmps.youtube.com/live2',
-                                    streamKey: 'integration-test-youtube-key',
-                                }],
-                            }),
-                        ],
-                    } as IAutoOptimizerRequest,
-                    event => {
-                        if (event.code)
-                            eventCodes.push(event.code);
-                        if (event.code === 'dual_output_testing_workload') {
-                            clearTimeout(timeout);
-                            resolve();
-                        } else if (event.type === 'complete' || event.type === 'cancelled') {
-                            clearTimeout(timeout);
-                            reject(new Error(`Auto Optimizer stopped before the concurrent Dual Output workload; events=${eventCodes.join(',')}`));
-                        }
-                    });
-            });
-            await started;
-            await new Promise(resolve => setTimeout(resolve, 100));
-            await nativeRun!.cancel();
-            const result = await nativeRun!.result;
-            expect(result.status).to.equal('cancelled');
-            expect(result.error.code).to.equal('cancelled');
-            nativeRun = null;
-        } finally {
-            if (nativeRun)
-                await nativeRun.cancel().catch(() => undefined);
-            verticalCanvas.destroy();
-        }
-    });
+    for (const horizontalPlatform of ['twitch', 'youtube', 'kick'] as const) {
+        it(`tests concurrent ${horizontalPlatform}/YouTube Dual Output workloads and cancels before bandwidth probing`, async function() {
+            const verticalCanvas = osn.VideoFactory.create();
+            let nativeRun: AutoOptimizerRun | null = null;
+            try {
+                const started = new Promise<void>((resolve, reject) => {
+                    const eventCodes: string[] = [];
+                    const timeout = setTimeout(
+                        () => reject(new Error(`Timed out waiting for the concurrent Dual Output workload; events=${eventCodes.join(',')}`)),
+                        15000);
+                    nativeRun = autoOptimizer.run(
+                        {
+                            streamSetup: 'dual-output',
+                            outputs: [
+                                output({
+                                    outputId: 'horizontal',
+                                    display: 'horizontal',
+                                    destinations: horizontalPlatform === 'kick' ? ['kick'] : [horizontalPlatform, 'kick'],
+                                    probes: horizontalPlatform === 'kick' ? [] : [{
+                                        id: 'dual-cancel-horizontal',
+                                        kind: horizontalPlatform === 'twitch' ? 'twitch-standard' : 'youtube-unbound',
+                                        server: horizontalPlatform === 'twitch' ? 'rtmp://live.twitch.tv/app' : 'rtmps://a.rtmps.youtube.com/live2',
+                                        streamKey: 'integration-test-key',
+                                    }],
+                                }),
+                                output({
+                                    outputId: 'vertical',
+                                    display: 'vertical',
+                                    destinations: ['youtube'],
+                                    current: {
+                                        ...output().current,
+                                        canvasId: verticalCanvas.canvasId,
+                                        width: 720,
+                                        height: 1280,
+                                    },
+                                    probes: [{
+                                        id: 'dual-cancel-youtube',
+                                        kind: 'youtube-unbound',
+                                        server: 'rtmps://a.rtmps.youtube.com/live2',
+                                        streamKey: 'integration-test-youtube-key',
+                                    }],
+                                }),
+                            ],
+                        } as IAutoOptimizerRequest,
+                        event => {
+                            if (event.code)
+                                eventCodes.push(event.code);
+                            if (event.code === 'dual_output_testing_workload') {
+                                clearTimeout(timeout);
+                                resolve();
+                            } else if (event.type === 'complete' || event.type === 'cancelled') {
+                                clearTimeout(timeout);
+                                reject(new Error(`Auto Optimizer stopped before the concurrent Dual Output workload; events=${eventCodes.join(',')}`));
+                            }
+                        });
+                });
+                await started;
+                await new Promise(resolve => setTimeout(resolve, 100));
+                await nativeRun!.cancel();
+                const result = await nativeRun!.result;
+                expect(result.status).to.equal('cancelled');
+                expect(result.error.code).to.equal('cancelled');
+                nativeRun = null;
+            } finally {
+                if (nativeRun)
+                    await nativeRun.cancel().catch(() => undefined);
+                verticalCanvas.destroy();
+            }
+        });
+    }
 
     it('cancels an active session before OBS_service resets its video context', async function() {
         const nativeRun = await startSessionAtHardwareAttempt();
