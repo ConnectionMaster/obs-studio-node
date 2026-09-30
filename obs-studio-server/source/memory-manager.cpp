@@ -59,6 +59,15 @@ struct MediaCacheManager::SourceEntry {
 	std::atomic<uint64_t> revision{1};
 	std::atomic<bool> removed{false};
 
+	// Serializes guard entry with cache-write validation and the OBS settings
+	// patch. Acquire only without m_mutex; graphics uses try_lock to avoid waiting.
+	// Guards release this before returning to the external settings writer.
+	std::mutex cacheWriteMutex;
+
+	// Settings guards and the graphics callback access these under the queue mutex.
+	unsigned settingsUpdatesInProgress = 0;
+	uint64_t queryAllowedFromTick = 0;
+
 	// Only the worker changes these fields, under the queue mutex.
 	uint64_t scheduledRevision = 0;
 	uint64_t reservedBytes = 0; // Includes an enable operation awaiting completion.
@@ -81,6 +90,24 @@ MediaCacheManager::MediaCacheManager(uint64_t budget) : m_cacheBudgetBytes(budge
 MediaCacheManager::~MediaCacheManager()
 {
 	shutdown();
+}
+
+MediaCacheManager::SourceSettingsUpdate::SourceSettingsUpdate(MediaCacheManager *manager, std::shared_ptr<SourceEntry> source) noexcept
+	: m_manager(manager), m_sourceEntry(std::move(source))
+{
+}
+
+MediaCacheManager::SourceSettingsUpdate::SourceSettingsUpdate(SourceSettingsUpdate &&other) noexcept
+	: m_manager(std::exchange(other.m_manager, nullptr)), m_sourceEntry(std::move(other.m_sourceEntry))
+{
+}
+
+MediaCacheManager::SourceSettingsUpdate::~SourceSettingsUpdate()
+{
+	if (m_manager)
+		m_manager->finishSourceSettingsUpdate(m_sourceEntry);
+	// Dropping m_sourceEntry may release the last OBS source reference, so it must
+	// happen after the queue mutex is unlocked.
 }
 
 void MediaCacheManager::initialize()
@@ -141,6 +168,59 @@ void MediaCacheManager::requestCacheUpdate(obs_source_t *source)
 		if (!m_accepting || it == m_sources.end())
 			return;
 		++it->second->revision;
+		m_notified = true;
+	}
+	m_changed.notify_all();
+}
+
+MediaCacheManager::SourceSettingsUpdate MediaCacheManager::trackSourceSettingsUpdate(obs_source_t *source, obs_data_t *pendingSettings)
+{
+	std::shared_ptr<SourceEntry> entry;
+	{
+		std::lock_guard lock(m_mutex);
+		auto it = m_sources.find(source);
+		if (!m_accepting || it == m_sources.end())
+			return {nullptr, {}};
+		entry = it->second;
+	}
+	// A cache write already past validation must finish before the caller can
+	// change live settings. Never wait for that write while holding m_mutex.
+	std::lock_guard cacheWriteLock(entry->cacheWriteMutex);
+	{
+		std::lock_guard lock(m_mutex);
+		if (!m_accepting || entry->removed)
+			return {nullptr, {}};
+		++entry->revision;
+		++entry->settingsUpdatesInProgress;
+		m_notified = true;
+	}
+	// A partial update would otherwise inherit the old player's cache enable.
+	// Clear it before the caller can mutate local_file, and also sanitize any
+	// supplied settings copy. Do not call obs_source_update here: that would
+	// schedule the plugin before the caller has finished its settings changes.
+	OBSDataAutoRelease settings = obs_source_get_settings(source);
+	obs_data_set_bool(settings, "caching", false);
+	if (pendingSettings)
+		obs_data_set_bool(pendingSettings, "caching", false);
+	// Keep the old reservation until a fresh query after the guarded update.
+	// An older SetCaching completion may still be waiting for the worker, and
+	// the old player can still be alive until OBS applies the external update.
+	m_changed.notify_all();
+	return {this, std::move(entry)};
+}
+
+void MediaCacheManager::finishSourceSettingsUpdate(const std::shared_ptr<SourceEntry> &source)
+{
+	{
+		std::lock_guard lock(m_mutex);
+		if (!m_accepting || source->removed)
+			return;
+		--source->settingsUpdatesInProgress;
+		++source->revision;
+		// Tick callbacks run before deferred source updates. The first callback
+		// after this write must skip querying; the following callback is after
+		// OBS has had a source-update phase, even if the write finished mid-frame.
+		source->queryAllowedFromTick = m_graphicsTick + 2;
 		m_notified = true;
 	}
 	m_changed.notify_all();
@@ -223,7 +303,7 @@ void MediaCacheManager::setCaching(obs_source_t *source, bool caching)
 	// Apply only our setting; never write back an old copy of the source's
 	// unrelated settings after the user has edited them.
 	OBSDataAutoRelease patch = obs_data_create();
-	// "caching" is a custom Streamlabs setting, OBS does not use it
+	// Streamlabs setting consumed by ffmpeg_source to enable media caching.
 	obs_data_set_bool(patch, "caching", caching);
 	obs_source_update(source, patch);
 }
@@ -237,10 +317,20 @@ void MediaCacheManager::graphicsTick(void *param, float)
 		if (!manager.m_accepting)
 			return;
 
-		// Take one batch per tick.
-		while (!manager.m_graphicsJobs.empty() && results.size() < JOBS_PER_TICK) {
-			results.push_back({std::move(manager.m_graphicsJobs.front())});
+		++manager.m_graphicsTick;
+		// Scan one bounded batch. Keep delayed queries queued without consuming
+		// readiness retries or blocking work for another source behind them.
+		const auto count = std::min(manager.m_graphicsJobs.size(), JOBS_PER_TICK);
+		for (size_t i = 0; i < count; ++i) {
+			auto job = std::move(manager.m_graphicsJobs.front());
 			manager.m_graphicsJobs.pop_front();
+			const auto &entry = *job.source;
+			if (job.type == JobType::QuerySource && !entry.removed && entry.revision == job.revision &&
+			    (entry.settingsUpdatesInProgress || manager.m_graphicsTick < entry.queryAllowedFromTick)) {
+				manager.m_graphicsJobs.push_back(std::move(job));
+				continue;
+			}
+			results.push_back({std::move(job)});
 		}
 	}
 	if (results.empty())
@@ -251,6 +341,14 @@ void MediaCacheManager::graphicsTick(void *param, float)
 	// its deferred settings update first.
 	for (auto &result : results) {
 		auto &job = result.job;
+		std::unique_lock<std::mutex> cacheWriteLock;
+		if (job.type == JobType::SetCaching) {
+			// Hold through revision/settings validation and the write. Otherwise a
+			// guard could change local_file after we validate the old reservation.
+			cacheWriteLock = std::unique_lock(job.source->cacheWriteMutex, std::try_to_lock);
+			if (!cacheWriteLock.owns_lock())
+				continue; // An unapplied completion schedules fresh evaluation.
+		}
 		if (job.source->removed || job.source->revision != job.revision)
 			continue;
 		result.valid = true;
@@ -259,7 +357,7 @@ void MediaCacheManager::graphicsTick(void *param, float)
 			queryMediaOnGraphicsThread(job.source->source, result.snapshot);
 		} else if (!job.targetCachingEnabled || (result.snapshot.eligible && result.snapshot.file == job.file)) {
 			if (result.snapshot.caching != job.targetCachingEnabled)
-				setCaching(job.source->source, job.targetCachingEnabled);
+				manager.m_setCaching(job.source->source, job.targetCachingEnabled);
 			result.applied = true;
 		}
 	}

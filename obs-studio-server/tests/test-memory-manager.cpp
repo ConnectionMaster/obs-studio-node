@@ -1,14 +1,20 @@
 #include <catch2/catch_test_macros.hpp>
 #include "memory-manager.h"
 #include "obs-setup.hpp"
+#include "osn-error.hpp"
 #include "osn-source.hpp"
 #include <obs.hpp>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <functional>
+#include <future>
+#include <initializer_list>
+#include <optional>
 #include <thread>
+#include <utility>
 
 using namespace std::chrono_literals;
 
@@ -25,6 +31,12 @@ public:
 		return manager;
 	}
 	static void tick(MediaCacheManager &manager) { MediaCacheManager::graphicsTick(&manager, 0); }
+	// Install only while the graphics executor is stopped.
+	static void interceptCacheWrites(MediaCacheManager &manager, std::function<void(obs_source_t *, bool)> write)
+	{
+		manager.m_setCaching = std::move(write);
+	}
+	static void setCaching(obs_source_t *source, bool caching) { MediaCacheManager::setCaching(source, caching); }
 	static bool waitForQueuedGraphicsJob(MediaCacheManager &manager, std::chrono::milliseconds timeout = 2s)
 	{
 		std::unique_lock lock(manager.m_mutex);
@@ -37,6 +49,12 @@ public:
 		return manager.m_changed.wait_for(lock, 2s, [&] {
 			return !manager.m_notified && manager.m_completions.empty() && manager.m_graphicsJobs.empty() && manager.m_retiredEntries.empty();
 		});
+	}
+	// A settings update can deliberately leave a graphics query queued.
+	static bool waitForWorkerPass(MediaCacheManager &manager)
+	{
+		std::unique_lock lock(manager.m_mutex);
+		return manager.m_changed.wait_for(lock, 2s, [&] { return !manager.m_notified && manager.m_completions.empty(); });
 	}
 	static void wake(MediaCacheManager &manager)
 	{
@@ -66,25 +84,40 @@ public:
 namespace {
 struct MediaState {
 	std::atomic<bool> ready{true};
+	std::atomic<uint32_t> appliedWidth{10};
 	std::atomic<unsigned> queries{0};
 	std::atomic<unsigned> destroys{0};
+	std::atomic<unsigned> largeFileCachedUpdates{0};
 	std::atomic<bool> graphicsOnly{true};
 	std::function<void()> onQuery;
+	std::function<void(obs_data_t *)> onProperties;
 };
+
+void applyMediaSettings(void *data, obs_data_t *settings)
+{
+	// Model player replacement only when OBS invokes the source's update callback.
+	// One I420 frame is 150 bytes normally, 300 for medium.webm, or 1500 for large.webm.
+	const char *file = obs_data_get_string(settings, "local_file");
+	auto &state = *static_cast<MediaState *>(data);
+	state.appliedWidth = strcmp(file, "large.webm") == 0 ? 100 : strcmp(file, "medium.webm") == 0 ? 20 : 10;
+	if (state.appliedWidth == 100 && obs_data_get_bool(settings, "caching"))
+		++state.largeFileCachedUpdates;
+}
 
 void getFileInfo(void *data, calldata_t *cd)
 {
 	auto &state = *static_cast<MediaState *>(data);
+	const auto width = state.appliedWidth.load();
 	++state.queries;
 	if (!obs_in_task_thread(OBS_TASK_GRAPHICS))
 		state.graphicsOnly = false;
 	if (state.onQuery)
 		state.onQuery();
 	calldata_set_bool(cd, "have_video", true);
-	calldata_set_int(cd, "width", 10);
+	calldata_set_int(cd, "width", width);
 	calldata_set_int(cd, "height", 10);
 	calldata_set_int(cd, "num_frames", state.ready ? 1 : 0);
-	calldata_set_int(cd, "pix_format", VIDEO_FORMAT_I420); // 10 × 10 × 1 × 1.5 = 150 bytes per source.
+	calldata_set_int(cd, "pix_format", VIDEO_FORMAT_I420);
 }
 
 void getPlaying(void *data, calldata_t *cd)
@@ -107,14 +140,30 @@ public:
 		info.get_name = [](void *) { return "Cache test media"; };
 		info.create = [](obs_data_t *settings, obs_source_t *source) -> void * {
 			auto *state = reinterpret_cast<MediaState *>(obs_data_get_int(settings, "test_state"));
+			applyMediaSettings(state, settings);
 			proc_handler_t *handler = obs_source_get_proc_handler(source);
 			proc_handler_add(handler, "void get_file_info(out int num_frames)", getFileInfo, state);
 			proc_handler_add(handler, "void get_playing(out bool playing)", getPlaying, state);
 			return state;
 		};
+		info.update = applyMediaSettings;
 		info.destroy = [](void *data) { ++static_cast<MediaState *>(data)->destroys; };
-		info.get_width = [](void *) -> uint32_t { return 10; };
+		info.get_width = [](void *data) -> uint32_t { return static_cast<MediaState *>(data)->appliedWidth; };
 		info.get_height = [](void *) -> uint32_t { return 10; };
+		info.get_properties = [](void *data) {
+			auto *properties = obs_properties_create();
+			auto *file = obs_properties_add_text(properties, "local_file", "File", OBS_TEXT_DEFAULT);
+			obs_property_set_modified_callback2(
+				file,
+				[](void *data, obs_properties_t *, obs_property_t *, obs_data_t *settings) {
+					auto &state = *static_cast<MediaState *>(data);
+					if (state.onProperties)
+						state.onProperties(settings);
+					return false;
+				},
+				data);
+			return properties;
+		};
 		obs_register_source(&info);
 	}
 	~ObsCore()
@@ -145,9 +194,47 @@ void setLooping(MediaCacheManager &manager, obs_source_t *source, bool looping)
 {
 	OBSDataAutoRelease settings = obs_data_create();
 	obs_data_set_bool(settings, "looping", looping);
+	auto update = manager.trackSourceSettingsUpdate(source, settings);
 	obs_source_update(source, settings);
-	manager.requestCacheUpdate(source);
 }
+
+void setFile(MediaCacheManager &manager, obs_source_t *source, const char *file)
+{
+	OBSDataAutoRelease settings = obs_data_create();
+	obs_data_set_string(settings, "local_file", file);
+	auto update = manager.trackSourceSettingsUpdate(source, settings);
+	obs_source_update(source, settings);
+}
+
+void runFrame(MediaCacheManager &manager, std::initializer_list<obs_source_t *> sources)
+{
+	REQUIRE(MediaCacheManagerTestAccess::waitForWorkerPass(manager));
+	// Preserve libobs's order: tick callbacks precede deferred source updates.
+	MediaCacheManagerTestAccess::tick(manager);
+	for (auto *source : sources)
+		obs_source_video_tick(source, 0);
+	REQUIRE(MediaCacheManagerTestAccess::waitForWorkerPass(manager));
+}
+
+// Exercise OSN source entry points with the fake ffmpeg_source registered by
+// ObsCore. Full OSN initialization would load the real implementation under
+// the same source ID.
+class RegisteredApiSource {
+public:
+	explicit RegisteredApiSource(obs_source_t *source) : id(osn::Source::Manager::GetInstance().allocate(source))
+	{
+		MediaCacheManager::GetInstance().initialize();
+		MediaCacheManager::GetInstance().registerSource(source);
+	}
+	~RegisteredApiSource()
+	{
+		MediaCacheManager::GetInstance().shutdown();
+		osn::Source::Manager::GetInstance().free(id);
+	}
+	RegisteredApiSource(const RegisteredApiSource &) = delete;
+	RegisteredApiSource &operator=(const RegisteredApiSource &) = delete;
+	const uint64_t id;
+};
 
 bool processGraphicsJobsUntil(MediaCacheManager &manager, const std::function<bool()> &predicate)
 {
@@ -158,6 +245,439 @@ bool processGraphicsJobsUntil(MediaCacheManager &manager, const std::function<bo
 	}
 	return predicate();
 }
+}
+
+TEST_CASE("Media cache waits for deferred file updates before reserving memory", "[media-cache][settings]")
+{
+	bool editAgain = false;
+	SECTION("One file replacement") {}
+	SECTION("Another edit during the settling interval")
+	{
+		editAgain = true;
+	}
+
+	MediaState state;
+	state.ready = false;
+	std::atomic<int64_t> milliseconds{0};
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300, &milliseconds);
+	auto source = makeCacheTestSource("small.webm", state);
+	manager->registerSource(source);
+	runFrame(*manager, {source});
+	REQUIRE(state.queries == 1);
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+
+	state.ready = true;
+	setFile(*manager, source, editAgain ? "medium.webm" : "large.webm");
+	REQUIRE(state.appliedWidth == 10); // Live settings changed, but the player has not.
+	runFrame(*manager, {source});
+	CHECK(state.queries == 1);
+	CHECK(state.appliedWidth == (editAgain ? 20 : 100));
+	if (editAgain) {
+		setFile(*manager, source, "large.webm");
+		runFrame(*manager, {source});
+		CHECK(state.queries == 1);
+	}
+	for (int i = 0; i < 4; ++i)
+		runFrame(*manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(state.queries == 2);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
+}
+
+TEST_CASE("Media cache settings guards cover paused nested and moved updates", "[media-cache][settings]")
+{
+	MediaState changing, ready;
+	std::atomic<int64_t> milliseconds{0};
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300, &milliseconds);
+	auto source = makeCacheTestSource("small.webm", changing);
+	auto other = makeCacheTestSource("other", ready);
+	manager->registerSource(source);
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuedGraphicsJob(*manager));
+
+	std::optional<MediaCacheManager::SourceSettingsUpdate> update(manager->trackSourceSettingsUpdate(source));
+	OBSDataAutoRelease settings = obs_source_get_settings(source);
+	obs_data_set_string(settings, "local_file", "large.webm");
+	// Pause after the live settings mutation, before scheduling the plugin update.
+	// More than MAX_POLLS frames must neither query old metadata nor consume retries.
+	manager->registerSource(other);
+	for (int i = 0; i < 12; ++i)
+		runFrame(*manager, {source, other});
+	CHECK(changing.queries == 0);
+	CHECK(changing.appliedWidth == 10);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(isCachingEnabled(other));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+
+	std::optional<MediaCacheManager::SourceSettingsUpdate> moved(std::move(*update));
+	update.reset(); // The moved-from guard must not finish the update.
+	{
+		auto nested = manager->trackSourceSettingsUpdate(source);
+		obs_source_update(source, nullptr);
+	}
+	runFrame(*manager, {source, other});
+	CHECK(changing.queries == 0); // The outer guard still holds the query.
+	CHECK(changing.appliedWidth == 100);
+	moved.reset();
+	runFrame(*manager, {source, other});
+	CHECK(changing.queries == 0);
+	for (int i = 0; i < 4; ++i)
+		runFrame(*manager, {source, other});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(changing.queries == 1);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+}
+
+TEST_CASE("Media cache discards metadata when settings change during a query", "[media-cache][settings]")
+{
+	MediaState state;
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300);
+	auto source = makeCacheTestSource("small.webm", state);
+	bool edited = false;
+	state.onQuery = [&] {
+		if (!std::exchange(edited, true))
+			setFile(*manager, source, "large.webm");
+	};
+	manager->registerSource(source);
+	runFrame(*manager, {source});
+	REQUIRE(edited);
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
+	for (int i = 0; i < 4; ++i)
+		runFrame(*manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(state.queries == 2);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
+}
+
+TEST_CASE("Media cache finishes a validated cache write before a settings guard returns", "[media-cache][settings]")
+{
+	MediaState state;
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300);
+	auto source = makeCacheTestSource("small.webm", state);
+	manager->registerSource(source);
+	runFrame(*manager, {source}); // Reserve 150 bytes and queue the enable operation.
+	REQUIRE(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+	REQUIRE(MediaCacheManagerTestAccess::queuedGraphicsJobCount(*manager) == 1);
+	REQUIRE_FALSE(isCachingEnabled(source));
+
+	std::promise<void> writeReached, guardAttempted, guardEntered;
+	auto writeReachedFuture = writeReached.get_future();
+	auto guardAttemptedFuture = guardAttempted.get_future();
+	auto guardEnteredFuture = guardEntered.get_future();
+	std::atomic<bool> writeInProgress{false};
+	bool attempted = false;
+	bool overlapped = false;
+	std::string fileAtWrite;
+	MediaCacheManagerTestAccess::interceptCacheWrites(*manager, [&](obs_source_t *target, bool caching) {
+		writeInProgress = true;
+		writeReached.set_value();
+		attempted = guardAttemptedFuture.wait_for(2s) == std::future_status::ready;
+		// Give the other thread a chance to enter the guard while this selected
+		// enable is paused after validation, immediately before its OBS write.
+		guardEnteredFuture.wait_for(100ms);
+		OBSDataAutoRelease settings = obs_source_get_settings(target);
+		fileAtWrite = obs_data_get_string(settings, "local_file");
+		// Reentry must remain safe: the cache-write mutex is not the queue mutex.
+		manager->requestCacheUpdate(target);
+		MediaCacheManagerTestAccess::setCaching(target, caching);
+		writeInProgress = false;
+	});
+	auto editor = std::async(std::launch::async, [&] {
+		if (writeReachedFuture.wait_for(2s) != std::future_status::ready)
+			return false;
+		guardAttempted.set_value();
+		auto update = manager->trackSourceSettingsUpdate(source);
+		overlapped = writeInProgress;
+		// Omit caching, as callers of the public partial-update API can do.
+		// The guard must clear the old enable before these settings are merged.
+		OBSDataAutoRelease settings = obs_data_create();
+		obs_data_set_string(settings, "local_file", "large.webm");
+		obs_source_update(source, settings);
+		guardEntered.set_value();
+		return true;
+	});
+	// Only run the manager callback here; the source update follows after the
+	// editor finishes, making the stale-enable consequence deterministic.
+	MediaCacheManagerTestAccess::tick(*manager);
+	REQUIRE(editor.get());
+	MediaCacheManagerTestAccess::interceptCacheWrites(*manager, MediaCacheManagerTestAccess::setCaching);
+	obs_source_video_tick(source, 0);
+	CHECK(attempted);
+	CHECK_FALSE(overlapped);
+	CHECK(fileAtWrite == "small.webm");
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(state.largeFileCachedUpdates == 0);
+	for (int i = 0; i < 4; ++i)
+		runFrame(*manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
+	CHECK_FALSE(isCachingEnabled(source));
+}
+
+TEST_CASE("Media cache reconciles reservations after partial file updates", "[media-cache][settings]")
+{
+	MediaState changing, waiting;
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300);
+	auto source = makeCacheTestSource("small.webm", changing);
+	auto other = makeCacheTestSource("medium.webm", waiting);
+	manager->registerSource(source);
+	for (int i = 0; i < 2; ++i)
+		runFrame(*manager, {source});
+	REQUIRE(isCachingEnabled(source));
+	REQUIRE(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+	manager->registerSource(other);
+	runFrame(*manager, {source, other});
+	REQUIRE_FALSE(isCachingEnabled(other)); // Its 300 bytes do not fit yet.
+	{
+		auto update = manager->trackSourceSettingsUpdate(source);
+		CHECK_FALSE(isCachingEnabled(source));
+		OBSDataAutoRelease settings = obs_data_create();
+		obs_data_set_string(settings, "local_file", "large.webm");
+		obs_source_update(source, settings);
+		for (int i = 0; i < 3; ++i)
+			runFrame(*manager, {source, other});
+		CHECK(changing.appliedWidth == 100);
+		CHECK(changing.queries == 1);
+		CHECK(changing.largeFileCachedUpdates == 0);
+		CHECK_FALSE(isCachingEnabled(source));
+		CHECK_FALSE(isCachingEnabled(other));
+		CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+	}
+	runFrame(*manager, {source, other}); // First callback still precedes the fence.
+	CHECK(changing.queries == 1);
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+	for (int i = 0; i < 5; ++i)
+		runFrame(*manager, {source, other});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(changing.queries >= 2); // Budget rebalancing can request another query.
+	CHECK(changing.largeFileCachedUpdates == 0);
+	CHECK_FALSE(isCachingEnabled(source)); // 1500 bytes exceed the budget.
+	CHECK(isCachingEnabled(other));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 300);
+}
+
+TEST_CASE("Media cache cancels a queued enable when a settings guard starts first", "[media-cache][settings]")
+{
+	MediaState state;
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300);
+	auto source = makeCacheTestSource("small.webm", state);
+	manager->registerSource(source);
+	runFrame(*manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+	REQUIRE_FALSE(isCachingEnabled(source));
+	{
+		auto update = manager->trackSourceSettingsUpdate(source);
+		OBSDataAutoRelease settings = obs_data_create();
+		obs_data_set_string(settings, "local_file", "large.webm");
+		obs_source_update(source, settings);
+		// Graphics must finish while the guard is still alive; the old enable
+		// is invalidated, and the new query waits without blocking this tick.
+		for (int i = 0; i < 3; ++i)
+			runFrame(*manager, {source});
+		CHECK(state.queries == 1);
+		CHECK_FALSE(isCachingEnabled(source));
+		CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
+	}
+	for (int i = 0; i < 4; ++i)
+		runFrame(*manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(state.queries == 2);
+	CHECK(state.largeFileCachedUpdates == 0);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
+}
+
+TEST_CASE("Media cache settings guards retain removed sources through shutdown", "[media-cache][settings][shutdown]")
+{
+	bool stop = false;
+	SECTION("Unregister with a pending guard") {}
+	SECTION("Stop with a pending guard")
+	{
+		stop = true;
+	}
+
+	MediaState state;
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300);
+	auto source = makeCacheTestSource("small.webm", state);
+	manager->registerSource(source);
+	std::optional<MediaCacheManager::SourceSettingsUpdate> update(manager->trackSourceSettingsUpdate(source));
+	setFile(*manager, source, "large.webm");
+	runFrame(*manager, {source});
+	CHECK(state.queries == 0);
+	if (stop)
+		manager->shutdown();
+	else {
+		manager->unregisterSource(source);
+		REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	}
+	source = nullptr;
+	obs_wait_for_destroy_queue();
+	CHECK(state.destroys == 0);
+	update.reset();
+	manager->shutdown(); // Join before checking the worker's final reference release.
+	obs_wait_for_destroy_queue();
+	CHECK(state.destroys == 1);
+	CHECK(MediaCacheManagerTestAccess::queuedGraphicsJobCount(*manager) == 0);
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
+}
+
+TEST_CASE("Media cache settings guards keep the original registration identity", "[media-cache][settings]")
+{
+	MediaState state;
+	ObsCore core;
+	auto manager = MediaCacheManagerTestAccess::create(300);
+	auto source = makeCacheTestSource("small.webm", state);
+	manager->registerSource(source);
+	std::optional<MediaCacheManager::SourceSettingsUpdate> update(manager->trackSourceSettingsUpdate(source));
+	manager->unregisterSource(source);
+	manager->registerSource(source); // Same OBS pointer, different cache entry.
+	update.reset();
+	for (int i = 0; i < 4; ++i)
+		runFrame(*manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(state.queries == 1);
+	CHECK(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 150);
+}
+
+TEST_CASE("OSN source settings entry points defer media cache queries", "[media-cache][settings]")
+{
+	bool useProperties = false;
+	SECTION("Source Update") {}
+	SECTION("Source GetProperties")
+	{
+		useProperties = true;
+	}
+
+	MediaState state;
+	state.ready = false;
+	ObsCore core;
+	auto source = makeCacheTestSource("small.webm", state);
+	RegisteredApiSource registration(source);
+	auto &manager = MediaCacheManager::GetInstance();
+	runFrame(manager, {source});
+	REQUIRE(state.queries == 1);
+	state.ready = true;
+	std::vector<ipc::value> response;
+	if (useProperties) {
+		// Ensure old work can run inside the property callback if invalidation
+		// is moved after obs_source_properties().
+		manager.requestCacheUpdate(source);
+		REQUIRE(MediaCacheManagerTestAccess::waitForQueuedGraphicsJob(manager));
+		bool called = false;
+		state.onProperties = [&](obs_data_t *settings) {
+			called = true;
+			obs_data_set_string(settings, "local_file", "large.webm");
+			// A property callback can expose new settings before GetProperties
+			// calls obs_source_update(). The guard must already be active here.
+			for (int i = 0; i < 3; ++i)
+				runFrame(manager, {source});
+			CHECK(state.queries == 1);
+			CHECK(state.appliedWidth == 10);
+		};
+		osn::Source::GetProperties(nullptr, 0, {ipc::value(registration.id)}, response);
+		CHECK(called);
+		state.onProperties = {};
+	} else {
+		osn::Source::Update(nullptr, 0, {ipc::value(registration.id), ipc::value(R"({"local_file":"large.webm"})")}, response);
+	}
+	REQUIRE(!response.empty());
+	REQUIRE(static_cast<ErrorCode>(response[0].value_union.ui64) == ErrorCode::Ok);
+	CHECK(state.appliedWidth == 10);
+	runFrame(manager, {source});
+	CHECK(state.queries == 1);
+	CHECK(state.appliedWidth == 100);
+	for (int i = 0; i < 4; ++i)
+		runFrame(manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(manager));
+	CHECK(state.queries == 2);
+	CHECK(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(manager) == 1500);
+	// The manager's own caching write must settle, without invalidating itself.
+	for (int i = 0; i < 3; ++i)
+		runFrame(manager, {source});
+	CHECK(state.queries == 2);
+}
+
+TEST_CASE("OSN source edits discard the previous media cache enable", "[media-cache][settings]")
+{
+	bool useProperties = false;
+	bool useSettingsCopy = false;
+	SECTION("Partial Source Update") {}
+	SECTION("Source Update with a copied cache enable")
+	{
+		useSettingsCopy = true;
+	}
+	SECTION("Source GetProperties")
+	{
+		useProperties = true;
+	}
+
+	MediaState state;
+	ObsCore core;
+	auto source = makeCacheTestSource("small.webm", state);
+	RegisteredApiSource registration(source);
+	auto &manager = MediaCacheManager::GetInstance();
+	for (int i = 0; i < 2; ++i)
+		runFrame(manager, {source});
+	REQUIRE(isCachingEnabled(source));
+	REQUIRE(state.queries == 1);
+	REQUIRE(MediaCacheManagerTestAccess::reservedBytes(manager) == 150);
+
+	std::vector<ipc::value> response;
+	if (useProperties) {
+		bool called = false;
+		state.onProperties = [&](obs_data_t *settings) {
+			called = true;
+			CHECK_FALSE(obs_data_get_bool(settings, "caching"));
+			obs_data_set_string(settings, "local_file", "large.webm");
+			runFrame(manager, {source});
+			// Guard entry must not schedule a plugin update of its own while
+			// property callbacks are still changing the live settings.
+			CHECK(state.appliedWidth == 10);
+			CHECK(state.queries == 1);
+		};
+		osn::Source::GetProperties(nullptr, 0, {ipc::value(registration.id)}, response);
+		CHECK(called);
+		state.onProperties = {};
+	} else {
+		OBSDataAutoRelease current = obs_source_get_settings(source);
+		OBSDataAutoRelease settings = useSettingsCopy ? obs_data_create_from_json(obs_data_get_json(current)) : obs_data_create();
+		obs_data_set_string(settings, "local_file", "large.webm");
+		if (useSettingsCopy)
+			REQUIRE(obs_data_get_bool(settings, "caching"));
+		else
+			REQUIRE_FALSE(obs_data_has_user_value(settings, "caching"));
+		osn::Source::Update(nullptr, 0, {ipc::value(registration.id), ipc::value(obs_data_get_json(settings))}, response);
+	}
+	REQUIRE(!response.empty());
+	REQUIRE(static_cast<ErrorCode>(response[0].value_union.ui64) == ErrorCode::Ok);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(state.appliedWidth == 10);
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(manager) == 150);
+	runFrame(manager, {source});
+	CHECK(state.appliedWidth == 100);
+	CHECK(state.queries == 1);
+	CHECK(state.largeFileCachedUpdates == 0);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(manager) == 150);
+	runFrame(manager, {source});
+	CHECK(state.queries == 2);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(manager) == 1500);
+	runFrame(manager, {source});
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(manager));
+	CHECK(isCachingEnabled(source));
+	CHECK(state.largeFileCachedUpdates == 1); // Only after the new size is admitted.
 }
 
 TEST_CASE("Media cache serializes rebalance and coalesces notifications", "[media-cache]")
@@ -391,6 +911,29 @@ TEST_CASE("Media cache uses graphics across video reset and permits callback ree
 	while (isCachingEnabled(source) && std::chrono::steady_clock::now() < deadline)
 		std::this_thread::sleep_for(5ms);
 	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(state.graphicsOnly);
+	REQUIRE(obs_remove_video_info(obs_get_video_info_by_index2(0)) == OBS_VIDEO_SUCCESS);
+
+	// Replace an uncached player's file with no graphics thread running. The
+	// pending query must survive reset and wait for the new player's metadata.
+	const auto queriesBeforeReset = state.queries.load();
+	{
+		auto update = manager->trackSourceSettingsUpdate(source);
+		OBSDataAutoRelease settings = obs_data_create();
+		obs_data_set_string(settings, "local_file", "large.webm");
+		obs_data_set_bool(settings, "looping", true);
+		obs_source_update(source, settings);
+	}
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuedGraphicsJob(*manager));
+	REQUIRE(obs_reset_video(&info) == OBS_VIDEO_SUCCESS);
+	const auto resetDeadline = std::chrono::steady_clock::now() + 3s;
+	while (state.queries == queriesBeforeReset && std::chrono::steady_clock::now() < resetDeadline)
+		std::this_thread::sleep_for(5ms);
+	REQUIRE(state.queries > queriesBeforeReset);
+	REQUIRE(MediaCacheManagerTestAccess::waitForQueuesToDrain(*manager));
+	CHECK(state.appliedWidth == 100);
+	CHECK_FALSE(isCachingEnabled(source));
+	CHECK(MediaCacheManagerTestAccess::reservedBytes(*manager) == 0);
 	CHECK(state.graphicsOnly);
 	REQUIRE(obs_remove_video_info(obs_get_video_info_by_index2(0)) == OBS_VIDEO_SUCCESS);
 	manager->requestCacheUpdate(source);
