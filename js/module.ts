@@ -1515,6 +1515,16 @@ export interface IVideoInfo {
     fpsType: EFPSType;
 }
 
+/** Result of `NodeObs.OBS_content_takeScreenshot`. */
+export interface IScreenshotResult {
+    /** Full path of the PNG that was written. */
+    path: string;
+    /** Image width in pixels (the canvas base width). */
+    width: number;
+    /** Image height in pixels (the canvas base height). */
+    height: number;
+}
+
 export interface IVideo {
     video: IVideoInfo;
     legacySettings: IVideoInfo;
@@ -2500,6 +2510,39 @@ interface INodeObs {
      * @throws {Error} If the IPC request fails or the server rejects the save
      */
     OBS_settings_saveSettings(category: string, settings: any[]): void;
+
+    /**
+     * Renders the program output of `video` at its base resolution and writes
+     * it as a PNG, mirroring OBS Studio's "Screenshot Output". The canvas is
+     * rendered and staged on one graphics tick and read back on the next;
+     * alpha fix-up and PNG encoding run on a background thread. The call
+     * returns a promise without blocking on IPC, and it resolves once the PNG
+     * has been written.
+     *
+     * The file is named `Screenshot <filenameFormat>.png` with the OBS
+     * filename tokens expanded; missing subfolders in the format are created.
+     * When `noSpace` is true every space becomes `_`. If the name is taken,
+     * ` (2)`, ` (3)`, ... (or `_2`, `_3`, ...) is inserted before the
+     * extension.
+     *
+     * Passing an array captures every canvas from the same frame in one call.
+     * Each file name then also gets its canvas' base resolution appended
+     * (e.g. `Screenshot 2026-09-29 12-00-00 1920x1080.png`) before the normal
+     * dedupe suffix. If any canvas fails, the whole call rejects naming that
+     * canvas; screenshots already written for other canvases in the batch are
+     * not removed. At most 4 screenshot jobs may be in flight at once.
+     * @param video - Video context(s) whose main (program) mix is captured
+     * @param directory - Existing directory to write into
+     * @param filenameFormat - OBS filename formatting pattern, e.g. `%CCYY-%MM-%DD %hh-%mm-%ss`
+     * @param noSpace - Replace spaces in the generated file name with underscores
+     * @returns The path written and the image dimensions for each canvas
+     * @throws {TypeError} Synchronously, if `video` is not an `IVideo` (or a non-empty array of them) or a string argument is missing
+     * @throws {Error} Synchronously, if there is no IPC connection to the server
+     * The promise rejects with an `Error` if a canvas has no running video, the directory does not exist,
+     * rendering, readback or PNG encoding fails, more than 4 screenshots would be in flight, or the IPC call fails
+     */
+    OBS_content_takeScreenshot(video: IVideo, directory: string, filenameFormat: string, noSpace?: boolean): Promise<IScreenshotResult>;
+    OBS_content_takeScreenshot(video: IVideo[], directory: string, filenameFormat: string, noSpace?: boolean): Promise<IScreenshotResult[]>;
 }
 
 export const enum VCamOutputType {

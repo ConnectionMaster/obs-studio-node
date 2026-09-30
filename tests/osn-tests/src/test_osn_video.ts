@@ -1,4 +1,7 @@
 import 'mocha';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { expect } from 'chai';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -278,5 +281,170 @@ describe(testName, () => {
             expect(device).to.have.property('description');
             logInfo(testName, `Video Capture Device Found: ${device.description} with id: ${device.id}`);
         }
+    });
+
+    describe('Take screenshot', () => {
+        const screenshotFormat = '%CCYY-%MM-%DD %hh-%mm-%ss';
+        let context: osn.IVideo;
+        let dir: string;
+
+        // Reads the IHDR chunk of a PNG: 8-byte signature, 4-byte length, 4-byte "IHDR", then width and height.
+        function readPngSize(file: string): { width: number; height: number } {
+            const bytes = fs.readFileSync(file);
+            expect(bytes.length).to.be.greaterThan(24, 'PNG is too short to hold a header');
+            expect(bytes.subarray(0, 8)).to.deep.equal(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), 'PNG signature mismatch');
+            expect(bytes.subarray(12, 16).toString('ascii')).to.equal('IHDR', 'first PNG chunk is not IHDR');
+            return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+        }
+
+        beforeEach(() => {
+            dir = fs.mkdtempSync(path.join(os.tmpdir(), 'osn-screenshot-'));
+            context = osn.VideoFactory.create();
+            context.video = {
+                fpsNum: 30,
+                fpsDen: 1,
+                baseWidth: 1280,
+                baseHeight: 720,
+                outputWidth: 1280,
+                outputHeight: 720,
+                outputFormat: osn.EVideoFormat.NV12,
+                colorspace: osn.EColorSpace.CS709,
+                range: osn.ERangeType.Partial,
+                scaleType: osn.EScaleType.Bilinear,
+                fpsType: osn.EFPSType.Fractional,
+            };
+        });
+
+        afterEach(() => {
+            context.destroy();
+            fs.rmSync(dir, { recursive: true, force: true });
+        });
+
+        it('Writes a PNG of the canvas at base resolution into the directory', async () => {
+            const result = await osn.NodeObs.OBS_content_takeScreenshot(context, dir, screenshotFormat, false);
+
+            expect(result).to.not.equal(undefined, 'takeScreenshot returned nothing');
+            expect(path.dirname(result.path)).to.equal(dir, 'screenshot was written outside the requested directory');
+            expect(path.basename(result.path)).to.match(/^Screenshot \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}\.png$/);
+            expect(result.width).to.equal(1280);
+            expect(result.height).to.equal(720);
+
+            const size = readPngSize(result.path);
+            expect(size.width).to.equal(1280, 'PNG width does not match the canvas base width');
+            expect(size.height).to.equal(720, 'PNG height does not match the canvas base height');
+        });
+
+        it('Never overwrites: a second screenshot with the same name gets a " (2)" suffix', async () => {
+            // Same second, so the same generated name; the second call must wait for the
+            // first file to land or the dedupe check will not see it yet.
+            const first = await osn.NodeObs.OBS_content_takeScreenshot(context, dir, 'same-name', false);
+            const second = await osn.NodeObs.OBS_content_takeScreenshot(context, dir, 'same-name', false);
+
+            expect(path.basename(first.path)).to.equal('Screenshot same-name.png');
+            expect(path.basename(second.path)).to.equal('Screenshot same-name (2).png');
+            expect(fs.existsSync(first.path)).to.equal(true);
+            expect(fs.existsSync(second.path)).to.equal(true);
+        });
+
+        it('Replaces spaces with underscores when noSpace is set', async () => {
+            const result = await osn.NodeObs.OBS_content_takeScreenshot(context, dir, 'no space', true);
+            expect(path.basename(result.path)).to.equal('Screenshot_no_space.png');
+
+            const again = await osn.NodeObs.OBS_content_takeScreenshot(context, dir, 'no space', true);
+            expect(path.basename(again.path)).to.equal('Screenshot_no_space_2.png');
+        });
+
+        it('Rejects when the directory does not exist', async () => {
+            const missing = path.join(dir, 'does-not-exist');
+            let error: Error;
+            try {
+                await osn.NodeObs.OBS_content_takeScreenshot(context, missing, screenshotFormat, false);
+            } catch (e) {
+                error = e;
+            }
+            expect(error).to.not.equal(undefined, 'expected the promise to reject');
+        });
+
+        it('Throws when the first argument is not a video context', () => {
+            // N-API rejects the unwrap of a plain object ("Invalid argument") before the binding's own check runs.
+            expect(() => osn.NodeObs.OBS_content_takeScreenshot({} as any, dir, screenshotFormat, false)).to.throw(
+                /Invalid argument|not a Video object/,
+            );
+        });
+
+        it('Throws synchronously when given an empty array of canvases', () => {
+            expect(() => osn.NodeObs.OBS_content_takeScreenshot([], dir, screenshotFormat, false)).to.throw(/must not be empty/);
+        });
+
+        it('Returns a pending promise immediately instead of blocking the caller', async () => {
+            const callStart = Date.now();
+            const promise = osn.NodeObs.OBS_content_takeScreenshot(context, dir, screenshotFormat, false);
+            const callDuration = Date.now() - callStart;
+
+            expect(promise).to.be.instanceOf(Promise);
+            expect(callDuration).to.be.lessThan(500, 'takeScreenshot blocked the caller instead of returning a pending promise');
+
+            const result = await promise;
+            expect(fs.existsSync(result.path)).to.equal(true);
+        });
+
+        it('Creates a missing subfolder named by the filename format', async () => {
+            const result = await osn.NodeObs.OBS_content_takeScreenshot(context, dir, 'subdir/%CCYY-%MM-%DD %hh-%mm-%ss', false);
+
+            expect(fs.existsSync(result.path)).to.equal(true);
+            expect(path.dirname(result.path)).to.not.equal(dir, 'expected a subfolder to have been created');
+            expect(fs.existsSync(path.dirname(result.path))).to.equal(true);
+        });
+
+        it('Captures every canvas from one call and suffixes each name with its resolution', async () => {
+            const secondContext = osn.VideoFactory.create();
+            secondContext.video = {
+                fpsNum: 30,
+                fpsDen: 1,
+                baseWidth: 640,
+                baseHeight: 480,
+                outputWidth: 640,
+                outputHeight: 480,
+                outputFormat: osn.EVideoFormat.NV12,
+                colorspace: osn.EColorSpace.CS709,
+                range: osn.ERangeType.Partial,
+                scaleType: osn.EScaleType.Bilinear,
+                fpsType: osn.EFPSType.Fractional,
+            };
+
+            try {
+                const results = await osn.NodeObs.OBS_content_takeScreenshot([context, secondContext], dir, screenshotFormat, false);
+
+                expect(results).to.have.lengthOf(2);
+                expect(path.basename(results[0].path)).to.match(/^Screenshot \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} 1280x720\.png$/);
+                expect(path.basename(results[1].path)).to.match(/^Screenshot \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} 640x480\.png$/);
+
+                const firstSize = readPngSize(results[0].path);
+                expect(firstSize.width).to.equal(1280);
+                expect(firstSize.height).to.equal(720);
+
+                const secondSize = readPngSize(results[1].path);
+                expect(secondSize.width).to.equal(640);
+                expect(secondSize.height).to.equal(480);
+            } finally {
+                secondContext.destroy();
+            }
+        });
+
+        it('Rejects a batch larger than the 4-job limit without writing any file', async () => {
+            let error: Error;
+            try {
+                await osn.NodeObs.OBS_content_takeScreenshot([context, context, context, context, context], dir, screenshotFormat, false);
+            } catch (e) {
+                error = e;
+            }
+            expect(error).to.not.equal(undefined, 'expected the promise to reject');
+            expect(error.message).to.match(/busy/);
+            expect(fs.readdirSync(dir)).to.have.lengthOf(0, 'a rejected batch must not write any screenshot');
+
+            const result = await osn.NodeObs.OBS_content_takeScreenshot(context, dir, screenshotFormat, false);
+            expect(fs.existsSync(result.path)).to.equal(true);
+            expect(fs.readdirSync(dir)).to.have.lengthOf(1);
+        });
     });
 });

@@ -27,7 +27,9 @@
 #include "osn-error.hpp"
 #include "shared.hpp"
 #include "osn-video.hpp"
+#include "osn-screenshot.hpp"
 
+#include <cstring>
 #include <thread>
 
 std::map<std::string, OBS::Display *> displays;
@@ -217,6 +219,13 @@ void OBS_content::Register(ipc::server &srv)
 
 	cls->register_function(
 		std::make_shared<ipc::function>("OBS_content_createIOSurface", std::vector<ipc::type>{ipc::type::String}, OBS_content_createIOSurface));
+
+	cls->register_function(std::make_shared<ipc::function>(
+		"OBS_content_takeScreenshot", std::vector<ipc::type>{ipc::type::Binary, ipc::type::String, ipc::type::String, ipc::type::UInt32},
+		OBS_content_takeScreenshot));
+
+	cls->register_function(
+		std::make_shared<ipc::function>("OBS_content_getScreenshotResult", std::vector<ipc::type>{ipc::type::UInt64}, OBS_content_getScreenshotResult));
 
 	srv.register_collection(cls);
 	g_srv = &srv;
@@ -675,5 +684,55 @@ void OBS_content::OBS_content_createIOSurface(void *data, const int64_t id, cons
 #elif WIN32
 	rval.push_back(ipc::value((uint64_t)ErrorCode::Ok));
 #endif
+	AUTO_DEBUG;
+}
+
+void OBS_content::OBS_content_takeScreenshot(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval)
+{
+	if (args.size() < 4 || args[0].value_bin.empty() || (args[0].value_bin.size() % sizeof(uint64_t)) != 0) {
+		rval.push_back(ipc::value((uint64_t)ErrorCode::Error));
+		rval.push_back(ipc::value("takeScreenshot expects (canvasIds, directory, filenameFormat, noSpace)."));
+		return;
+	}
+
+	std::vector<uint64_t> canvasIds(args[0].value_bin.size() / sizeof(uint64_t));
+	memcpy(canvasIds.data(), args[0].value_bin.data(), args[0].value_bin.size());
+
+	const std::string directory = args[1].value_str;
+	const std::string format = args[2].value_str;
+	const bool noSpace = args[3].value_union.ui32 != 0;
+
+	std::vector<uint64_t> jobIds;
+	std::string error;
+	if (!ScreenshotManager::GetInstance().Submit(canvasIds, directory, format, noSpace, jobIds, error)) {
+		rval.push_back(ipc::value((uint64_t)ErrorCode::Error));
+		rval.push_back(ipc::value(error));
+		return;
+	}
+
+	std::vector<char> jobIdBytes(jobIds.size() * sizeof(uint64_t));
+	memcpy(jobIdBytes.data(), jobIds.data(), jobIdBytes.size());
+
+	rval.push_back(ipc::value((uint64_t)ErrorCode::Ok));
+	rval.push_back(ipc::value(jobIdBytes));
+	AUTO_DEBUG;
+}
+
+void OBS_content::OBS_content_getScreenshotResult(void *data, const int64_t id, const std::vector<ipc::value> &args, std::vector<ipc::value> &rval)
+{
+	if (args.size() < 1) {
+		rval.push_back(ipc::value((uint64_t)ErrorCode::Error));
+		rval.push_back(ipc::value("getScreenshotResult expects (jobId)."));
+		return;
+	}
+
+	ScreenshotManager::Result result = ScreenshotManager::GetInstance().Query(args[0].value_union.ui64);
+
+	rval.push_back(ipc::value((uint64_t)ErrorCode::Ok));
+	rval.push_back(ipc::value((uint32_t)result.state));
+	rval.push_back(ipc::value(result.path));
+	rval.push_back(ipc::value((uint32_t)result.width));
+	rval.push_back(ipc::value((uint32_t)result.height));
+	rval.push_back(ipc::value(result.error));
 	AUTO_DEBUG;
 }
