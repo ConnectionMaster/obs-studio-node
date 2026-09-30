@@ -1,5 +1,7 @@
 import 'mocha';
 import { expect } from 'chai';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as osn from '../osn';
 import { logInfo, logEmptyLine } from '../util/logger';
 import { OBSHandler } from '../util/obs_handler';
@@ -8,6 +10,15 @@ import { ETestErrorMsg, GetErrorMessage } from '../util/error_messages';
 import { EFPSType } from '../osn';
 
 const testName = 'osn-video';
+
+function countSkippedSetVideoCalls(): number {
+    const logDir = path.join(__dirname, '..', 'osnData', 'slobs-client', 'node-obs', 'logs');
+    const newest = fs.readdirSync(logDir)
+        .map(name => ({ name, mtime: fs.statSync(path.join(logDir, name)).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime)[0];
+    const log = fs.readFileSync(path.join(logDir, newest.name), 'utf8');
+    return log.split('Set video context skipped').length - 1;
+}
 
 describe(testName, () => {
     let obs: OBSHandler;
@@ -189,6 +200,72 @@ describe(testName, () => {
 
         secondContext.destroy();
 
+        context.destroy();
+    });
+
+    it('Re-applying identical video settings is accepted and later changes still apply', () => {
+        const context = osn.VideoFactory.create();
+        const videoInfo: osn.IVideoInfo = {
+            fpsNum: 60,
+            fpsDen: 1,
+            baseWidth: 1280,
+            baseHeight: 720,
+            outputWidth: 1280,
+            outputHeight: 720,
+            outputFormat: osn.EVideoFormat.NV12,
+            colorspace: osn.EColorSpace.CS709,
+            range: osn.ERangeType.Partial,
+            scaleType: osn.EScaleType.Bicubic,
+            fpsType: EFPSType.Fractional
+        };
+        context.video = videoInfo;
+        const skippedBefore = countSkippedSetVideoCalls();
+        // identical re-applies: must succeed, be skipped by the server, and read back unchanged
+        context.video = videoInfo;
+        context.video = { ...videoInfo };
+        expect(countSkippedSetVideoCalls() - skippedBefore).to.equal(2, 'Identical video settings were not skipped');
+        let current = context.video;
+        expect(current.baseWidth).to.equal(1280, GetErrorMessage(ETestErrorMsg.VideoSetBaseWidth));
+        expect(current.baseHeight).to.equal(720, GetErrorMessage(ETestErrorMsg.VideoSetBaseHeight));
+        expect(current.outputWidth).to.equal(1280, GetErrorMessage(ETestErrorMsg.VideoSetOutputWidth));
+        expect(current.fpsNum).to.equal(60, GetErrorMessage(ETestErrorMsg.VideoSetFPSNum));
+        expect(current.scaleType).to.equal(osn.EScaleType.Bicubic, GetErrorMessage(ETestErrorMsg.VideoSetScaleType));
+        // a real change after the no-op re-applies must still be applied
+        context.video = { ...videoInfo, baseWidth: 1920, baseHeight: 1080, outputWidth: 1920, outputHeight: 1080, fpsNum: 30 };
+        current = context.video;
+        expect(current.baseWidth).to.equal(1920, GetErrorMessage(ETestErrorMsg.VideoSetBaseWidth));
+        expect(current.baseHeight).to.equal(1080, GetErrorMessage(ETestErrorMsg.VideoSetBaseHeight));
+        expect(current.outputWidth).to.equal(1920, GetErrorMessage(ETestErrorMsg.VideoSetOutputWidth));
+        expect(current.fpsNum).to.equal(30, GetErrorMessage(ETestErrorMsg.VideoSetFPSNum));
+        context.destroy();
+    });
+
+    it('Re-applying settings after a failed video update is not skipped', () => {
+        const context = osn.VideoFactory.create();
+        const videoInfo: osn.IVideoInfo = {
+            fpsNum: 60,
+            fpsDen: 1,
+            baseWidth: 1280,
+            baseHeight: 720,
+            outputWidth: 1280,
+            outputHeight: 720,
+            outputFormat: osn.EVideoFormat.NV12,
+            colorspace: osn.EColorSpace.CS709,
+            range: osn.ERangeType.Partial,
+            scaleType: osn.EScaleType.Bicubic,
+            fpsType: EFPSType.Fractional
+        };
+        context.video = videoInfo;
+        expect(() => {
+            context.video = { ...videoInfo, baseWidth: 0, baseHeight: 0, outputWidth: 0, outputHeight: 0 };
+        }).to.throw();
+
+        const skippedBefore = countSkippedSetVideoCalls();
+        context.video = videoInfo;
+        expect(countSkippedSetVideoCalls()).to.equal(skippedBefore, 'Settings were skipped after a failed update');
+        const current = context.video;
+        expect(current.baseWidth).to.equal(1280, GetErrorMessage(ETestErrorMsg.VideoSetBaseWidth));
+        expect(current.outputHeight).to.equal(720, GetErrorMessage(ETestErrorMsg.VideoSetOutputHeight));
         context.destroy();
     });
 
